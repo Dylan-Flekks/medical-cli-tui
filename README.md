@@ -1,0 +1,98 @@
+# Medical CLI TUI
+
+Medical CLI TUI is an experimental, local-first medical documentation project for terminal-based charting, record review, note editing, documentation auditing, and billing support.
+
+The project goal is a CLI-first medical records tool with a Ratatui dashboard. Medical storage is local by design. Cloud medical storage is out of scope. Optional AI integrations must pass an explicit BAA and compliance gate before any PHI can be sent to a third-party API.
+
+> This project is not a certified EHR, medical device, billing authority, or compliance guarantee. Do not use it for real patient care or real PHI until it has gone through professional security, legal, privacy, and clinical review.
+
+## Product Direction
+
+- Local encrypted SQLite records.
+- CLI workflows for automation and power users.
+- Ratatui dashboard for chart review, note writing, auditing, and billing support.
+- Structured medical records inspired by FHIR concepts.
+- Structured notes for SOAP, progress notes, H&P, discharge summaries, procedures, addenda, and billing documentation.
+- Documentation and billing audit checks.
+- Strict AI provider controls: no BAA, no PHI.
+- No PHI in GitHub issues, pull requests, logs, test fixtures, or example data.
+
+## Workspace
+
+```text
+crates/
+  med-core/        # domain models for charting, notes, billing, and audit events
+  med-store/       # local encrypted SQLite storage boundary
+  med-compliance/  # BAA registry and PHI policy checks
+  med-ai/          # AI provider abstractions and preflight enforcement
+  med-cli/         # CLI command surface
+  med-tui/         # Ratatui dashboard
+docs/
+  ARCHITECTURE.md
+  COMPLIANCE.md
+  MVP_PLAN.md
+  ROADMAP.md
+compliance/
+  vendors/example-ai.toml
+```
+
+## Current Status
+
+This repository is in project bootstrap. The initial codebase defines the architecture, CLI/TUI entry points, core medical data models, and BAA enforcement primitives. It is not production-ready.
+
+## Quick Start
+
+Install Rust, then run:
+
+```bash
+cargo run -p med-cli -- --help
+cargo run -p med-cli -- tui
+```
+
+On this machine, Rust may be available at `C:\Users\peter\.cargo\bin\cargo.exe` even if it is not on `PATH`.
+
+SQLCipher support is intended for PHI-capable builds, but it is not enabled by default because it requires additional platform crypto setup:
+
+```bash
+cargo build -p med-store --no-default-features --features sqlcipher
+```
+
+## Local Data Rule
+
+Medical data belongs outside the repository:
+
+```text
+~/.medical-cli/
+  records.db
+  attachments/
+  backups/
+  exports/
+```
+
+Never commit real PHI, screenshots containing PHI, clinical exports, logs with patient identifiers, model prompts containing PHI, or vendor BAA documents.
+
+## AI Provider Rule
+
+Third-party AI providers are disabled for PHI by default.
+
+Before an API can receive PHI, the local compliance registry must show:
+
+- BAA status is `executed`.
+- The exact provider service/model is covered.
+- The vendor is approved for PHI.
+- The approval has not expired or been revoked.
+- The attempted request is logged.
+
+If any of those checks fail, the app must block the AI call.
+
+## Contributing
+
+Contributions are welcome, especially around Rust architecture, terminal UX, clinical documentation templates, local encryption, auditability, billing workflows, accessibility, and deidentified test fixtures.
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request.
+
+CI is planned but not committed yet because GitHub workflow publishing requires a token with `workflow` scope.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

@@ -1,0 +1,19 @@
+# Example placeholder only.
+# Do not commit real BAA contracts, API keys, account identifiers, or PHI.
+
+provider = "example-ai"
+phi_allowed = false
+
+[baa]
+status = "missing"
+signed_at = ""
+expires_at = ""
+covered_services = []
+document_sha256 = ""
+secure_document_uri = ""
+
+[approval]
+approved = false
+approved_by = ""
+approved_at = ""
+notes = "Example vendor is not approved for PHI."

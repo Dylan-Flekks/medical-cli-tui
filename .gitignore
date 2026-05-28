@@ -1,0 +1,24 @@
+target/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+.env
+.env.*
+!.env.example
+
+# Local medical data must never be committed.
+.medical-cli/
+records/
+attachments/
+backups/
+exports/
+
+# Editor and OS files.
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

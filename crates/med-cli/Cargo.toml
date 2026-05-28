@@ -1,0 +1,21 @@
+[package]
+name = "med-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "med"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+med-ai = { path = "../med-ai" }
+med-compliance = { path = "../med-compliance" }
+med-core = { path = "../med-core" }
+med-store = { path = "../med-store" }
+med-tui = { path = "../med-tui" }
+time.workspace = true

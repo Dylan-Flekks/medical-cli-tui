@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/med-ai",
+    "crates/med-cli",
+    "crates/med-compliance",
+    "crates/med-core",
+    "crates/med-store",
+    "crates/med-tui",
+]
+resolver = "2"
+
+[workspace.package]
+authors = ["MedTUI contributors"]
+edition = "2021"
+homepage = "https://github.com/Dylan-Flekks/medical-cli-tui"
+license = "Apache-2.0"
+repository = "https://github.com/Dylan-Flekks/medical-cli-tui"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+ratatui = "0.29"
+rusqlite = { version = "0.32", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+tui-textarea = "0.7"
+uuid = { version = "1", features = ["serde", "v4"] }

@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest an improvement.
+title: "[feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include PHI or real clinical records.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow should this improve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What would you like to see?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI
+        - TUI
+        - Storage
+        - Notes
+        - Audit
+        - Billing
+        - AI/BAA gate
+        - Documentation
+        - Other
