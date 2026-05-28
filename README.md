@@ -17,6 +17,8 @@ The project goal is a CLI-first medical records tool with a Ratatui dashboard. M
 - Strict AI provider controls: no BAA, no PHI.
 - No PHI in GitHub issues, pull requests, logs, test fixtures, or example data.
 
+See [docs/TUI_DASHBOARD_PLAN.md](docs/TUI_DASHBOARD_PLAN.md) for the detailed dashboard build plan.
+
 ## Workspace
 
 ```text
