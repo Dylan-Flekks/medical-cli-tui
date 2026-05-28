@@ -597,6 +597,7 @@ dependencies = [
  "med-store",
  "med-tui",
  "time",
+ "uuid",
 ]
 
 [[package]]
@@ -624,7 +625,10 @@ version = "0.1.0"
 dependencies = [
  "med-core",
  "rusqlite",
+ "serde_json",
  "thiserror",
+ "time",
+ "uuid",
 ]
 
 [[package]]

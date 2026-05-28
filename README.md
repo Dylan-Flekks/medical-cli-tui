@@ -46,6 +46,11 @@ Install Rust, then run:
 
 ```bash
 cargo run -p med-cli -- --help
+cargo run -p med-cli -- init
+cargo run -p med-cli -- patient add "Synthetic Patient" --mrn MRN-SYNTH-001
+cargo run -p med-cli -- patient list
+cargo run -p med-cli -- encounter new <patient-id> --reason "Synthetic follow-up"
+cargo run -p med-cli -- encounter list <patient-id>
 cargo run -p med-cli -- tui
 ```
 
@@ -62,12 +67,15 @@ cargo build -p med-store --no-default-features --features sqlcipher
 Medical data belongs outside the repository:
 
 ```text
-~/.medical-cli/
+~/.medical-cli/          # default on Unix-like systems
+C:\Users\<you>\.medical-cli\  # default on Windows
   records.db
   attachments/
   backups/
   exports/
 ```
+
+Set `MEDCLI_DATA_DIR` to use another local directory.
 
 Never commit real PHI, screenshots containing PHI, clinical exports, logs with patient identifiers, model prompts containing PHI, or vendor BAA documents.
 

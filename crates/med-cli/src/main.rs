@@ -1,6 +1,12 @@
+use std::fs;
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use med_ai::{preflight_ai_request, AiDraftRequest};
+use med_core::{new_id, Encounter, EncounterStatus, EncounterType, Patient, PatientId};
+use med_store::LocalStore;
+use time::OffsetDateTime;
 
 #[derive(Debug, Parser)]
 #[command(name = "med")]
@@ -24,6 +30,12 @@ enum Command {
         command: PatientCommand,
     },
 
+    /// Encounter commands.
+    Encounter {
+        #[command(subcommand)]
+        command: EncounterCommand,
+    },
+
     /// Compliance and BAA registry commands.
     Vendor {
         #[command(subcommand)]
@@ -42,8 +54,27 @@ enum PatientCommand {
     /// List patients.
     List,
 
-    /// Add a synthetic placeholder patient.
-    Add { display_name: String },
+    /// Add a patient to the local repository.
+    Add {
+        display_name: String,
+
+        #[arg(long)]
+        mrn: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EncounterCommand {
+    /// List encounters for a patient.
+    List { patient_id: String },
+
+    /// Create a new in-progress office visit encounter.
+    New {
+        patient_id: String,
+
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -66,18 +97,95 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Init => {
-            println!("Initialize local encrypted storage at ~/.medical-cli (planned).");
-            println!("Do not store PHI in this repository.");
+            let paths = initialize_local_data_dir()?;
+            let _store = open_store()?;
+            println!("Initialized local medical data directory:");
+            println!("  {}", paths.data_dir.display());
+            println!("Database:");
+            println!("  {}", paths.database.display());
+            println!(
+                "Do not store PHI until SQLCipher/key handling has been configured and reviewed."
+            );
         }
         Command::Tui => med_tui::run()?,
         Command::Patient { command } => match command {
             PatientCommand::List => {
-                println!("Patient list is not connected to storage yet.");
-                println!("Next step: implement med-store repository methods.");
+                let store = open_store()?;
+                let patients = store.list_patients()?;
+
+                if patients.is_empty() {
+                    println!("No patients found.");
+                } else {
+                    for patient in patients {
+                        let mrn = patient
+                            .medical_record_number
+                            .unwrap_or_else(|| "-".to_owned());
+                        println!("{}\t{}\t{}", patient.id, mrn, patient.display_name);
+                    }
+                }
             }
-            PatientCommand::Add { display_name } => {
-                println!("Would add patient: {display_name}");
-                println!("Storage implementation is planned.");
+            PatientCommand::Add { display_name, mrn } => {
+                let store = open_store()?;
+                let now = OffsetDateTime::now_utc();
+                let patient = Patient {
+                    id: new_id(),
+                    medical_record_number: mrn,
+                    display_name,
+                    date_of_birth: None,
+                    sex_at_birth: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+
+                store.insert_patient(&patient)?;
+                println!("Created patient:");
+                println!("  id: {}", patient.id);
+                println!("  name: {}", patient.display_name);
+            }
+        },
+        Command::Encounter { command } => match command {
+            EncounterCommand::List { patient_id } => {
+                let store = open_store()?;
+                let patient_id = parse_patient_id(&patient_id)?;
+                let encounters = store.list_encounters_for_patient(patient_id)?;
+
+                if encounters.is_empty() {
+                    println!("No encounters found for patient {patient_id}.");
+                } else {
+                    for encounter in encounters {
+                        println!(
+                            "{}\t{:?}\t{:?}\t{}",
+                            encounter.id,
+                            encounter.encounter_type,
+                            encounter.status,
+                            encounter.reason.unwrap_or_else(|| "-".to_owned())
+                        );
+                    }
+                }
+            }
+            EncounterCommand::New { patient_id, reason } => {
+                let store = open_store()?;
+                let patient_id = parse_patient_id(&patient_id)?;
+
+                if store.get_patient(patient_id)?.is_none() {
+                    anyhow::bail!("patient {patient_id} does not exist");
+                }
+
+                let encounter = Encounter {
+                    id: new_id(),
+                    patient_id,
+                    practitioner_id: None,
+                    encounter_type: EncounterType::OfficeVisit,
+                    status: EncounterStatus::InProgress,
+                    started_at: OffsetDateTime::now_utc(),
+                    ended_at: None,
+                    reason,
+                };
+
+                store.insert_encounter(&encounter)?;
+                println!("Created encounter:");
+                println!("  id: {}", encounter.id);
+                println!("  patient_id: {}", encounter.patient_id);
             }
         },
         Command::Vendor { command } => match command {
@@ -108,4 +216,52 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+struct LocalPaths {
+    data_dir: PathBuf,
+    database: PathBuf,
+}
+
+fn initialize_local_data_dir() -> Result<LocalPaths> {
+    let paths = local_paths()?;
+    fs::create_dir_all(&paths.data_dir)?;
+    fs::create_dir_all(paths.data_dir.join("attachments"))?;
+    fs::create_dir_all(paths.data_dir.join("backups"))?;
+    fs::create_dir_all(paths.data_dir.join("exports"))?;
+    Ok(paths)
+}
+
+fn open_store() -> Result<LocalStore> {
+    let paths = initialize_local_data_dir()?;
+    let key = std::env::var("MEDCLI_DB_KEY")
+        .unwrap_or_else(|_| "development-only-default-key-not-for-production-phi".to_owned());
+
+    Ok(LocalStore::open_encrypted(paths.database, &key)?)
+}
+
+fn local_paths() -> Result<LocalPaths> {
+    let data_dir = match std::env::var_os("MEDCLI_DATA_DIR") {
+        Some(value) => PathBuf::from(value),
+        None => home_dir()?.join(".medical-cli"),
+    };
+
+    let database = data_dir.join("records.db");
+    Ok(LocalPaths { data_dir, database })
+}
+
+fn home_dir() -> Result<PathBuf> {
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        return Ok(PathBuf::from(home));
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home));
+    }
+
+    anyhow::bail!("could not determine home directory; set MEDCLI_DATA_DIR")
+}
+
+fn parse_patient_id(value: &str) -> Result<PatientId> {
+    Ok(uuid::Uuid::parse_str(value)?)
 }

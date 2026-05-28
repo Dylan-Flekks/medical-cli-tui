@@ -19,3 +19,4 @@ med-core = { path = "../med-core" }
 med-store = { path = "../med-store" }
 med-tui = { path = "../med-tui" }
 time.workspace = true
+uuid.workspace = true
