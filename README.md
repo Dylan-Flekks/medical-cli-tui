@@ -1,6 +1,6 @@
-# Medical CLI TUI
+# Flekks EMR CLI
 
-Medical CLI TUI is an experimental, local-first medical documentation project for terminal-based charting, record review, note editing, documentation auditing, and billing support.
+Flekks EMR CLI is an experimental, local-first medical documentation project for terminal-based charting, record review, note editing, documentation auditing, and billing support.
 
 The project goal is a CLI-first medical records tool with a Ratatui dashboard. Medical storage is local by design. Cloud medical storage is out of scope. Optional AI integrations must pass an explicit BAA and compliance gate before any PHI can be sent to a third-party API.
 
@@ -18,11 +18,14 @@ The project goal is a CLI-first medical records tool with a Ratatui dashboard. M
 - No PHI in GitHub issues, pull requests, logs, test fixtures, or example data.
 
 See [docs/TUI_DASHBOARD_PLAN.md](docs/TUI_DASHBOARD_PLAN.md) for the detailed dashboard build plan.
+See [docs/AGENT_HARNESS.md](docs/AGENT_HARNESS.md) for the medical agent harness plan.
+See [NOTICE](NOTICE) and [docs/ATTRIBUTION_POLICY.md](docs/ATTRIBUTION_POLICY.md) for attribution rules.
 
 ## Workspace
 
 ```text
 crates/
+  med-agent/      # medical agent harness, local tool registry, OpenAI BAA gate
   med-core/        # domain models for charting, notes, billing, and audit events
   med-store/       # local encrypted SQLite storage boundary
   med-compliance/  # BAA registry and PHI policy checks

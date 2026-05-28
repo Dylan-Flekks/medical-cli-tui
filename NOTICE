@@ -1,0 +1,23 @@
+Flekks EMR CLI
+Copyright 2026 Flekks EMR CLI contributors
+
+This project is licensed under the Apache License, Version 2.0.
+
+Architecture references:
+
+- OpenAI Codex CLI, licensed under Apache-2.0:
+  https://github.com/openai/codex
+
+  Flekks EMR CLI currently uses Codex as an architecture reference for
+  agent/session separation, tool registries, tool invocation context,
+  approval gates, and terminal UI testing patterns. No OpenAI Codex source
+  files have been copied into this repository at this time. If future work
+  copies or derives source code from Codex, the copied files must preserve
+  Apache-2.0 notices, clearly document modifications, and add file-level
+  attribution.
+
+- Ratatui, licensed under MIT:
+  https://github.com/ratatui/ratatui
+
+Third-party dependencies keep their own license terms. See Cargo.lock and
+crate metadata for dependency details.

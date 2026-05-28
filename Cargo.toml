@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/med-agent",
     "crates/med-ai",
     "crates/med-cli",
     "crates/med-compliance",
@@ -12,9 +13,9 @@ resolver = "2"
 [workspace.package]
 authors = ["MedTUI contributors"]
 edition = "2021"
-homepage = "https://github.com/Dylan-Flekks/medical-cli-tui"
+homepage = "https://github.com/Dylan-Flekks/flekks-emr-cli"
 license = "Apache-2.0"
-repository = "https://github.com/Dylan-Flekks/medical-cli-tui"
+repository = "https://github.com/Dylan-Flekks/flekks-emr-cli"
 rust-version = "1.80"
 
 [workspace.dependencies]

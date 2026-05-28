@@ -576,6 +576,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "med-agent"
+version = "0.1.0"
+dependencies = [
+ "med-ai",
+ "med-compliance",
+ "med-core",
+ "serde",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "med-ai"
 version = "0.1.0"
 dependencies = [

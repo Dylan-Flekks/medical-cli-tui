@@ -1,6 +1,6 @@
 # Architecture
 
-Medical CLI TUI is designed as a CLI-first local medical records application with a Ratatui dashboard.
+Flekks EMR CLI is designed as a CLI-first local medical records application with a Ratatui dashboard.
 
 ## Principles
 
@@ -19,6 +19,9 @@ med-cli
 
 med-tui
   Ratatui dashboard, key handling, screen state, widgets
+
+med-agent
+  medical agent harness, local tool registry, OpenAI BAA gate, TUI-facing agent events
 
 service layer
   patient, encounter, note, billing, audit, AI orchestration
