@@ -24,6 +24,8 @@ Useful patterns observed in the Rust implementation:
 
 Current usage: reference only. No Codex source files are copied.
 
+Extraction plan: `docs/CODEX_EXTRACTION_PLAN.md`.
+
 ## Google Gemini CLI
 
 Repository: <https://github.com/google-gemini/gemini-cli>

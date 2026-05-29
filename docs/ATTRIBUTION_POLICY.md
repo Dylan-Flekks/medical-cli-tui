@@ -31,6 +31,10 @@ Current Codex-inspired ideas:
 
 No Codex source files are currently copied into this repository.
 
+The planned extraction workflow is documented in `docs/CODEX_EXTRACTION_PLAN.md`.
+Any future copied or closely derived files must be recorded in
+`docs/CODEX_EXTRACTION_LOG.md` before merging.
+
 ## Medical Safety Override
 
 Even when an upstream license allows broad reuse, medical privacy and compliance requirements still apply.
