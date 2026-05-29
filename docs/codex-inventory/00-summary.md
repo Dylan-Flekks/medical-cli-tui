@@ -80,9 +80,15 @@ These are useful but high-risk for healthcare and must not be imported directly:
 - network proxying
 - app-server/cloud task assumptions
 
-## Next Report
+## Report 01
 
-The next report should map `codex-rs/core`:
+Completed:
+
+```text
+docs/codex-inventory/01-core-session-turn-loop.md
+```
+
+This report maps `codex-rs/core`:
 
 - session lifecycle
 - turn loop
@@ -93,3 +99,14 @@ The next report should map `codex-rs/core`:
 - event stream
 
 No Codex source files have been copied into Flekks EMR CLI.
+
+## Next Report
+
+The next report should map `codex-rs/core/src/tools`:
+
+- tool registry
+- tool runtime
+- approval orchestration
+- cancellation behavior
+- parallel tool execution
+- which handlers to delete, rewrite, or study only
