@@ -100,9 +100,15 @@ This report maps `codex-rs/core`:
 
 No Codex source files have been copied into Flekks EMR CLI.
 
-## Next Report
+## Report 02
 
-The next report should map `codex-rs/core/src/tools`:
+Completed:
+
+```text
+docs/codex-inventory/02-tool-runtime-and-approval.md
+```
+
+This report maps `codex-rs/core/src/tools`:
 
 - tool registry
 - tool runtime
@@ -110,3 +116,14 @@ The next report should map `codex-rs/core/src/tools`:
 - cancellation behavior
 - parallel tool execution
 - which handlers to delete, rewrite, or study only
+
+## Next Report
+
+The next report should map `codex-rs/tui`:
+
+- event loop
+- dashboard layout/state model
+- streaming turn updates
+- approval UI
+- status rendering
+- snapshot test patterns
