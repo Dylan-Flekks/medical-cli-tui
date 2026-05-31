@@ -30,7 +30,23 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ];
 
     if app.selected_tab == WorkspaceTab::Note {
-        spans.extend([" ctrl+s ".black().on_cyan(), " save  ".into()]);
+        spans.extend([
+            " ctrl+s ".black().on_cyan(),
+            " save  ".into(),
+            " S ".black().on_yellow(),
+            " sign blocked  ".into(),
+        ]);
+
+        if let Some(note_id) = app.note_draft_id {
+            let status = app.note_status.as_deref().unwrap_or("Draft");
+            let version = app
+                .note_version
+                .map(|version| format!(" v{version}"))
+                .unwrap_or_default();
+            spans.extend([format!(" note: {} {status}{version} ", short_id(note_id))
+                .black()
+                .on_dark_gray()]);
+        }
     }
 
     spans.extend([
@@ -45,4 +61,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let status = Line::from(spans);
 
     frame.render_widget(Paragraph::new(status), area);
+}
+
+fn short_id(id: impl std::fmt::Display) -> String {
+    id.to_string()[..8].to_owned()
 }

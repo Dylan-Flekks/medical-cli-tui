@@ -5,12 +5,15 @@ use med_agent::{
     MedicalToolRuntimeRegistry, SaveNoteDraftRequest,
 };
 use med_core::{
-    new_id, Encounter, EncounterId, EncounterStatus, EncounterType, NoteId, NoteSection,
-    NoteTemplate, Patient, PatientId,
+    new_id, ClinicalNote, Encounter, EncounterId, EncounterStatus, EncounterType, NoteId,
+    NoteSection, NoteStatus, NoteTemplate, Patient, PatientId,
 };
 use med_store::LocalStore;
 use time::{Date, OffsetDateTime};
 use tui_textarea::{CursorMove, Input, Key, TextArea};
+
+const SIGNING_BLOCKED_MESSAGE: &str =
+    "Signing guardrail: final signing is not implemented; draft remains editable";
 
 #[derive(Debug, Clone)]
 pub struct App {
@@ -20,6 +23,9 @@ pub struct App {
     pub data: DashboardData,
     pub note_editor: TextArea<'static>,
     pub note_draft_id: Option<NoteId>,
+    pub note_status: Option<String>,
+    pub note_version: Option<u32>,
+    pub note_updated_at: Option<String>,
     pub note_dirty: bool,
     pub last_message: String,
     pub should_quit: bool,
@@ -34,6 +40,9 @@ impl Default for App {
             data: DashboardData::empty(),
             note_editor: default_note_editor(),
             note_draft_id: None,
+            note_status: None,
+            note_version: None,
+            note_updated_at: None,
             note_dirty: false,
             last_message: "Local database not loaded".to_owned(),
             should_quit: false,
@@ -69,6 +78,11 @@ impl App {
             return Ok(());
         }
 
+        if self.selected_tab == WorkspaceTab::Note && is_note_sign_key(key) {
+            self.block_note_signing();
+            return Ok(());
+        }
+
         if self.note_editor_active() && is_note_editor_input_key(key) {
             self.note_dirty |= self.note_editor.input(note_editor_input(key));
             return Ok(());
@@ -81,6 +95,12 @@ impl App {
             }
             KeyCode::Char('n') => self.create_local_patient(store)?,
             KeyCode::Char('e') => self.create_encounter_for_selected_patient(store)?,
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('k') | KeyCode::Up => {
+                self.handle_key(key);
+                let selected_patient_id = self.active_patient().map(|patient| patient.id);
+                self.refresh_from_store_with_selection(store, selected_patient_id)?;
+                self.last_message = self.selection_message();
+            }
             _ => self.handle_key(key),
         }
 
@@ -90,6 +110,11 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         if self.note_editor_active() && is_note_editor_input_key(key) {
             self.note_dirty |= self.note_editor.input(note_editor_input(key));
+            return;
+        }
+
+        if self.selected_tab == WorkspaceTab::Note && is_note_sign_key(key) {
+            self.block_note_signing();
             return;
         }
 
@@ -132,14 +157,10 @@ impl App {
             records.push((patient, encounters));
         }
 
-        let previous_patient_id = self.active_patient().map(|patient| patient.id);
         self.selected_patient =
             selected_patient_index(&records, preferred_patient_id, self.selected_patient);
         self.data = DashboardData::from_local_records(&records, self.selected_patient);
-        let current_patient_id = self.active_patient().map(|patient| patient.id);
-        if previous_patient_id != current_patient_id {
-            self.reset_note_editor();
-        }
+        self.load_latest_note_draft(store)?;
 
         Ok(())
     }
@@ -184,7 +205,6 @@ impl App {
 
         store.insert_encounter(&encounter)?;
         self.refresh_from_store_with_selection(store, Some(patient_id))?;
-        self.reset_note_editor();
         self.last_message = "Created local encounter".to_owned();
 
         Ok(())
@@ -227,17 +247,61 @@ impl App {
             .cloned()
             .ok_or_else(|| anyhow!("save note tool did not return note_id"))
             .and_then(|value| serde_json::from_value(value).map_err(Into::into))?;
-        self.note_draft_id = Some(note_id);
-        self.note_dirty = false;
+        let note = store
+            .get_note(note_id)?
+            .ok_or_else(|| anyhow!("saved note draft {note_id} was not found"))?;
+        self.apply_note_metadata(&note);
         self.last_message = output.tui_summary;
 
         Ok(())
     }
 
+    fn load_latest_note_draft(&mut self, store: &LocalStore) -> Result<()> {
+        let Some(encounter_id) = self.active_encounter().map(|encounter| encounter.id) else {
+            self.reset_note_editor();
+            return Ok(());
+        };
+
+        if let Some(note) = store.latest_draft_note_for_encounter(encounter_id)? {
+            self.note_editor = note_editor_from_sections(&note.sections);
+            self.apply_note_metadata(&note);
+        } else {
+            self.reset_note_editor();
+        }
+
+        Ok(())
+    }
+
+    fn apply_note_metadata(&mut self, note: &ClinicalNote) {
+        self.note_draft_id = Some(note.id);
+        self.note_status = Some(note_status_label(&note.status).to_owned());
+        self.note_version = Some(note.version);
+        self.note_updated_at = Some(note.updated_at.to_string());
+        self.note_dirty = false;
+    }
+
     fn reset_note_editor(&mut self) {
         self.note_editor = default_note_editor();
         self.note_draft_id = None;
+        self.note_status = None;
+        self.note_version = None;
+        self.note_updated_at = None;
         self.note_dirty = false;
+    }
+
+    fn block_note_signing(&mut self) {
+        self.last_message = SIGNING_BLOCKED_MESSAGE.to_owned();
+
+        if !self
+            .data
+            .audit_flags
+            .iter()
+            .any(|flag| flag.message == SIGNING_BLOCKED_MESSAGE)
+        {
+            self.data
+                .audit_flags
+                .push(AuditFlagItem::blocked(SIGNING_BLOCKED_MESSAGE));
+        }
     }
 
     fn focus_next(&mut self) {
@@ -734,9 +798,48 @@ fn default_note_editor() -> TextArea<'static> {
     textarea
 }
 
+fn note_editor_from_sections(sections: &[NoteSection]) -> TextArea<'static> {
+    const HEADINGS: [&str; 4] = ["Subjective", "Objective", "Assessment", "Plan"];
+
+    let mut lines = Vec::new();
+
+    for heading in HEADINGS {
+        lines.push(format!("{heading}:"));
+
+        if let Some(section) = sections
+            .iter()
+            .find(|section| section.heading.eq_ignore_ascii_case(heading))
+        {
+            lines.extend(section.body.lines().map(ToOwned::to_owned));
+        }
+
+        lines.push(String::new());
+    }
+
+    let mut textarea = TextArea::from(lines);
+    textarea.move_cursor(CursorMove::Jump(1, 0));
+    textarea
+}
+
+fn note_status_label(status: &NoteStatus) -> &'static str {
+    match status {
+        NoteStatus::Draft => "Draft",
+        NoteStatus::Reviewed => "Reviewed",
+        NoteStatus::Signed => "Signed",
+        NoteStatus::Amended => "Amended",
+        NoteStatus::Voided => "Voided",
+    }
+}
+
 fn is_note_save_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn is_note_sign_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('S'))
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
 fn is_note_editor_input_key(key: KeyEvent) -> bool {
@@ -871,6 +974,69 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    fn insert_patient_with_encounter(
+        store: &LocalStore,
+        display_name: &str,
+    ) -> (PatientId, EncounterId) {
+        let now = OffsetDateTime::now_utc();
+        let patient = Patient {
+            id: new_id(),
+            medical_record_number: None,
+            display_name: display_name.to_owned(),
+            date_of_birth: None,
+            sex_at_birth: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let encounter = Encounter {
+            id: new_id(),
+            patient_id: patient.id,
+            practitioner_id: None,
+            encounter_type: EncounterType::OfficeVisit,
+            status: EncounterStatus::InProgress,
+            started_at: now,
+            ended_at: None,
+            reason: Some("Synthetic follow-up".to_owned()),
+        };
+
+        store.insert_patient(&patient).unwrap();
+        store.insert_encounter(&encounter).unwrap();
+
+        (patient.id, encounter.id)
+    }
+
+    fn upsert_test_note(
+        store: &LocalStore,
+        patient_id: PatientId,
+        encounter_id: EncounterId,
+        subjective: &str,
+        updated_at: OffsetDateTime,
+        version: u32,
+    ) -> NoteId {
+        let note = ClinicalNote {
+            id: new_id(),
+            patient_id,
+            encounter_id,
+            author_id: None,
+            template: NoteTemplate::Soap,
+            status: NoteStatus::Draft,
+            sections: vec![NoteSection {
+                heading: "Subjective".to_owned(),
+                body: subjective.to_owned(),
+                required: true,
+            }],
+            created_at: updated_at - time::Duration::minutes(1),
+            updated_at,
+            signed_at: None,
+            version,
+        };
+        let note_id = note.id;
+
+        store.upsert_note(&note).unwrap();
+
+        note_id
+    }
+
     #[test]
     fn number_keys_select_workspace_tabs() {
         let mut app = App::with_data(DashboardData::synthetic());
@@ -975,6 +1141,161 @@ mod tests {
         assert_eq!(encounters.len(), 1);
         assert_eq!(app.data.encounters.len(), 1);
         assert_eq!(app.data.encounters[0].short_id, short_id(encounters[0].id));
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn loads_latest_draft_for_active_encounter() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) =
+            insert_patient_with_encounter(&store, "Synthetic Draft Patient");
+        let now = OffsetDateTime::now_utc();
+        upsert_test_note(
+            &store,
+            patient_id,
+            encounter_id,
+            "Older subjective draft",
+            now,
+            1,
+        );
+        let latest_note_id = upsert_test_note(
+            &store,
+            patient_id,
+            encounter_id,
+            "Latest subjective draft",
+            now + time::Duration::minutes(5),
+            2,
+        );
+
+        let app = App::from_store(&store).unwrap();
+
+        assert_eq!(app.note_draft_id, Some(latest_note_id));
+        assert_eq!(app.note_status.as_deref(), Some("Draft"));
+        assert_eq!(app.note_version, Some(2));
+        assert_eq!(app.note_editor.lines()[1], "Latest subjective draft");
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn updating_loaded_draft_does_not_create_duplicate_notes() {
+        let (store, path) = temp_store();
+        let mut app = App::from_store(&store).unwrap();
+
+        app.handle_key_with_store(key(KeyCode::Char('n')), &store)
+            .unwrap();
+        app.handle_key_with_store(key(KeyCode::Char('e')), &store)
+            .unwrap();
+        app.selected_tab = WorkspaceTab::Note;
+        app.focus = FocusArea::Workspace;
+        app.note_editor = TextArea::from([
+            "Subjective:",
+            "Initial subjective text",
+            "Objective:",
+            "Initial objective text",
+            "Assessment:",
+            "Initial assessment text",
+            "Plan:",
+            "Initial plan text",
+        ]);
+        app.note_dirty = true;
+
+        app.handle_key_with_store(ctrl_key(KeyCode::Char('s')), &store)
+            .unwrap();
+        let encounter_id = app.active_encounter().unwrap().id;
+        let note_id = app.note_draft_id.unwrap();
+
+        app.note_editor = TextArea::from([
+            "Subjective:",
+            "Updated subjective text",
+            "Objective:",
+            "Updated objective text",
+            "Assessment:",
+            "Updated assessment text",
+            "Plan:",
+            "Updated plan text",
+        ]);
+        app.note_dirty = true;
+        app.handle_key_with_store(ctrl_key(KeyCode::Char('s')), &store)
+            .unwrap();
+
+        let notes = store.list_notes_for_encounter(encounter_id).unwrap();
+        let note = store.get_note(note_id).unwrap().unwrap();
+
+        assert_eq!(notes.len(), 1);
+        assert_eq!(note.version, 2);
+        assert_eq!(note.sections[0].body, "Updated subjective text");
+        assert_eq!(app.note_version, Some(2));
+        assert_eq!(app.note_draft_id, Some(note_id));
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn changing_patient_selection_loads_that_patients_latest_draft() {
+        let (store, path) = temp_store();
+        let (patient_a, encounter_a) = insert_patient_with_encounter(&store, "A Patient");
+        let (patient_b, encounter_b) = insert_patient_with_encounter(&store, "B Patient");
+        let now = OffsetDateTime::now_utc();
+        let note_a = upsert_test_note(&store, patient_a, encounter_a, "A patient note", now, 1);
+        let note_b = upsert_test_note(
+            &store,
+            patient_b,
+            encounter_b,
+            "B patient note",
+            now + time::Duration::minutes(1),
+            1,
+        );
+
+        let mut app = App::from_store(&store).unwrap();
+
+        assert_eq!(app.note_draft_id, Some(note_a));
+        assert_eq!(app.note_editor.lines()[1], "A patient note");
+
+        app.handle_key_with_store(key(KeyCode::Down), &store)
+            .unwrap();
+
+        assert_eq!(app.note_draft_id, Some(note_b));
+        assert_eq!(app.note_editor.lines()[1], "B patient note");
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn sign_key_is_blocked_without_changing_draft_status() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) =
+            insert_patient_with_encounter(&store, "Synthetic Sign Guard Patient");
+        let note_id = upsert_test_note(
+            &store,
+            patient_id,
+            encounter_id,
+            "Guarded draft",
+            OffsetDateTime::now_utc(),
+            1,
+        );
+        let mut app = App::from_store(&store).unwrap();
+        app.selected_tab = WorkspaceTab::Note;
+        app.focus = FocusArea::Workspace;
+
+        app.handle_key_with_store(key(KeyCode::Char('S')), &store)
+            .unwrap();
+
+        let note = store.get_note(note_id).unwrap().unwrap();
+
+        assert!(matches!(note.status, NoteStatus::Draft));
+        assert_eq!(app.note_draft_id, Some(note_id));
+        assert!(app.last_message.contains("Signing guardrail"));
+        assert!(app
+            .data
+            .audit_flags
+            .iter()
+            .any(|flag| flag.message == SIGNING_BLOCKED_MESSAGE));
 
         drop(store);
         cleanup(path);
