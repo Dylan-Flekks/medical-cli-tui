@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use med_core::{AuditEvent, Encounter, EncounterStatus, EncounterType, Patient, PatientId};
+use med_core::{
+    AuditEvent, ClinicalNote, Encounter, EncounterStatus, EncounterType, NoteId, NoteSection,
+    NoteStatus, NoteTemplate, Patient, PatientId, PractitionerId,
+};
 use rusqlite::{params, Connection, OpenFlags};
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
@@ -26,6 +29,9 @@ pub enum StoreError {
 
     #[error("invalid date value: {0}")]
     InvalidDate(String),
+
+    #[error("invalid note version value: {0}")]
+    InvalidNoteVersion(i64),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -58,6 +64,27 @@ impl LocalStore {
 
     pub fn apply_schema(&self) -> StoreResult<()> {
         self.connection.execute_batch(SCHEMA)?;
+        self.ensure_column("notes", "author_id", "text")?;
+        Ok(())
+    }
+
+    fn ensure_column(&self, table: &str, column: &str, definition: &str) -> StoreResult<()> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("pragma table_info({table})"))?;
+        let mut rows = statement.query([])?;
+
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(());
+            }
+        }
+
+        self.connection.execute(
+            &format!("alter table {table} add column {column} {definition}"),
+            [],
+        )?;
         Ok(())
     }
 
@@ -168,6 +195,123 @@ impl LocalStore {
         Ok(encounters)
     }
 
+    pub fn upsert_note(&self, note: &ClinicalNote) -> StoreResult<()> {
+        self.connection.execute(
+            "insert into notes (
+                id, patient_id, encounter_id, author_id, template, status, version, created_at, updated_at, signed_at
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            on conflict(id) do update set
+                patient_id = excluded.patient_id,
+                encounter_id = excluded.encounter_id,
+                author_id = excluded.author_id,
+                template = excluded.template,
+                status = excluded.status,
+                version = excluded.version,
+                updated_at = excluded.updated_at,
+                signed_at = excluded.signed_at",
+            params![
+                note.id.to_string(),
+                note.patient_id.to_string(),
+                note.encounter_id.to_string(),
+                note.author_id.map(|id| id.to_string()),
+                serde_json::to_string(&note.template)?,
+                serde_json::to_string(&note.status)?,
+                i64::from(note.version),
+                format_offset_date_time(note.created_at)?,
+                format_offset_date_time(note.updated_at)?,
+                note.signed_at.map(format_offset_date_time).transpose()?,
+            ],
+        )?;
+
+        self.connection.execute(
+            "delete from note_sections where note_id = ?1",
+            params![note.id.to_string()],
+        )?;
+
+        for (index, section) in note.sections.iter().enumerate() {
+            self.connection.execute(
+                "insert into note_sections (
+                    note_id, section_order, heading, body, required
+                ) values (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    note.id.to_string(),
+                    i64::try_from(index).unwrap_or(i64::MAX),
+                    section.heading.as_str(),
+                    section.body.as_str(),
+                    if section.required { 1 } else { 0 },
+                ],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    pub fn get_note(&self, id: NoteId) -> StoreResult<Option<ClinicalNote>> {
+        let mut statement = self.connection.prepare(
+            "select id, patient_id, encounter_id, author_id, template, status, version, created_at, updated_at, signed_at
+             from notes
+             where id = ?1",
+        )?;
+        let mut rows = statement.query(params![id.to_string()])?;
+
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+
+        let note_id: String = row.get(0)?;
+        let patient_id: String = row.get(1)?;
+        let encounter_id: String = row.get(2)?;
+        let author_id: Option<String> = row.get(3)?;
+        let template: String = row.get(4)?;
+        let status: String = row.get(5)?;
+        let version: i64 = row.get(6)?;
+        let created_at: String = row.get(7)?;
+        let updated_at: String = row.get(8)?;
+        let signed_at: Option<String> = row.get(9)?;
+
+        Ok(Some(ClinicalNote {
+            id: parse_uuid(&note_id)?,
+            patient_id: parse_uuid(&patient_id)?,
+            encounter_id: parse_uuid(&encounter_id)?,
+            author_id: author_id
+                .as_deref()
+                .map(parse_practitioner_id)
+                .transpose()?,
+            template: serde_json::from_str::<NoteTemplate>(&template)?,
+            status: serde_json::from_str::<NoteStatus>(&status)?,
+            sections: self.list_note_sections(id)?,
+            created_at: parse_offset_date_time(&created_at)?,
+            updated_at: parse_offset_date_time(&updated_at)?,
+            signed_at: signed_at
+                .as_deref()
+                .map(parse_offset_date_time)
+                .transpose()?,
+            version: u32::try_from(version).map_err(|_| StoreError::InvalidNoteVersion(version))?,
+        }))
+    }
+
+    fn list_note_sections(&self, note_id: NoteId) -> StoreResult<Vec<NoteSection>> {
+        let mut statement = self.connection.prepare(
+            "select heading, body, required
+             from note_sections
+             where note_id = ?1
+             order by section_order asc",
+        )?;
+        let mut rows = statement.query(params![note_id.to_string()])?;
+        let mut sections = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            let required: i64 = row.get(2)?;
+            sections.push(NoteSection {
+                heading: row.get(0)?,
+                body: row.get(1)?,
+                required: required != 0,
+            });
+        }
+
+        Ok(sections)
+    }
+
     pub fn append_audit_event(&self, event: &AuditEvent) -> StoreResult<()> {
         self.connection.execute(
             "insert into audit_events (
@@ -186,6 +330,13 @@ impl LocalStore {
         )?;
 
         Ok(())
+    }
+
+    pub fn audit_event_count(&self) -> StoreResult<usize> {
+        let count: i64 =
+            self.connection
+                .query_row("select count(*) from audit_events", [], |row| row.get(0))?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
 }
 
@@ -232,6 +383,10 @@ fn encounter_from_row(row: &rusqlite::Row<'_>) -> StoreResult<Encounter> {
 
 fn parse_uuid(value: &str) -> StoreResult<Uuid> {
     Ok(Uuid::parse_str(value)?)
+}
+
+fn parse_practitioner_id(value: &str) -> StoreResult<PractitionerId> {
+    parse_uuid(value)
 }
 
 fn format_offset_date_time(value: OffsetDateTime) -> StoreResult<String> {
@@ -301,6 +456,7 @@ create table if not exists notes (
     id text primary key,
     patient_id text not null references patients(id),
     encounter_id text not null references encounters(id),
+    author_id text,
     template text not null,
     status text not null,
     version integer not null,

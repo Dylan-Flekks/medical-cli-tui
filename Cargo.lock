@@ -582,9 +582,12 @@ dependencies = [
  "med-ai",
  "med-compliance",
  "med-core",
+ "med-store",
  "serde",
+ "serde_json",
  "thiserror",
  "time",
+ "uuid",
 ]
 
 [[package]]

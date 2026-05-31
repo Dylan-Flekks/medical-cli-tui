@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{Date, OffsetDateTime};
 
+pub mod tools;
+
+pub use tools::{
+    MedicalApprovalDecision, MedicalApprovalPolicy, MedicalToolContext, MedicalToolError,
+    MedicalToolInvocation, MedicalToolOutput, MedicalToolPayload, MedicalToolRisk,
+    MedicalToolRuntime, MedicalToolRuntimeRegistry, ReadPatientSummaryRequest,
+    SaveNoteDraftRequest,
+};
+
 #[derive(Debug, Clone)]
 pub struct MedicalAgentHarness {
     tools: MedicalToolRegistry,
