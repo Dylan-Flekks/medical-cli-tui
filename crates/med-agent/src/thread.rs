@@ -28,12 +28,13 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::protocol::{
-    MedicalAgentErrorEvent, MedicalAgentStatus, MedicalApprovalResolvedEvent, MedicalEvent,
+    MedicalAgentErrorEvent, MedicalAgentStatus, MedicalApprovalClass, MedicalEvent,
     MedicalEventMsg, MedicalLoopLimits, MedicalOp, MedicalPolicyBlock, MedicalPolicyBlockedEvent,
-    MedicalProviderUse, MedicalSessionConfiguredEvent, MedicalSubmission, MedicalTurnAbortReason,
-    MedicalTurnAbortedEvent, MedicalTurnCompleteEvent, MedicalTurnRequest, MedicalTurnStartedEvent,
-    ProviderBaaStatus,
+    MedicalProviderUse, MedicalReviewDecision, MedicalSessionConfiguredEvent, MedicalSubmission,
+    MedicalTurnAbortReason, MedicalTurnAbortedEvent, MedicalTurnRequest, ProviderBaaStatus,
 };
+use crate::turn::{ActiveMedicalTurn, ActiveMedicalTurnError};
+use crate::MedicalToolName;
 
 #[derive(Debug, Clone)]
 pub struct MedicalAgentThreadConfig {
@@ -179,7 +180,7 @@ struct MedicalSessionLoop {
     rx_submission: Receiver<MedicalSubmission>,
     tx_event: SyncSender<MedicalEvent>,
     status: Arc<Mutex<MedicalAgentStatus>>,
-    active_turn_id: Option<String>,
+    active_turn: Option<ActiveMedicalTurn>,
 }
 
 impl MedicalSessionLoop {
@@ -194,7 +195,7 @@ impl MedicalSessionLoop {
             rx_submission,
             tx_event,
             status,
-            active_turn_id: None,
+            active_turn: None,
         }
     }
 
@@ -227,27 +228,19 @@ impl MedicalSessionLoop {
             }
             MedicalOp::Shutdown => {
                 self.set_status(MedicalAgentStatus::ShuttingDown);
-                if let Some(turn_id) = self.active_turn_id.take() {
+                if let Some(mut turn) = self.active_turn.take() {
                     self.emit(
                         Some(submission.id.clone()),
-                        MedicalEventMsg::TurnAborted(MedicalTurnAbortedEvent {
-                            turn_id,
-                            reason: MedicalTurnAbortReason::Shutdown,
-                            redacted_summary: "Turn stopped during local agent shutdown".to_owned(),
-                        }),
+                        MedicalEventMsg::TurnAborted(turn.abort(
+                            MedicalTurnAbortReason::Shutdown,
+                            "Turn stopped during local agent shutdown",
+                        )),
                     );
                 }
                 self.emit(Some(submission.id), MedicalEventMsg::ShutdownComplete);
             }
             MedicalOp::ApproveAction(response) | MedicalOp::DenyAction(response) => {
-                self.emit(
-                    Some(submission.id),
-                    MedicalEventMsg::ApprovalResolved(MedicalApprovalResolvedEvent {
-                        approval_id: response.approval_id,
-                        turn_id: response.turn_id,
-                        decision: response.decision,
-                    }),
-                );
+                self.resolve_approval(submission.id, response);
             }
             MedicalOp::SaveNoteDraft { .. } | MedicalOp::RunLocalAudit { .. } => {
                 self.emit(
@@ -265,19 +258,17 @@ impl MedicalSessionLoop {
     fn start_turn(&mut self, submission_id: String, request: MedicalTurnRequest) {
         let turn_id = new_id().to_string();
 
-        if let Some(active_turn_id) = self.active_turn_id.replace(turn_id.clone()) {
+        if let Some(mut active_turn) = self.active_turn.take() {
             self.emit(
                 Some(submission_id.clone()),
-                MedicalEventMsg::TurnAborted(MedicalTurnAbortedEvent {
-                    turn_id: active_turn_id,
-                    reason: MedicalTurnAbortReason::ReplacedByNewTurn,
-                    redacted_summary: "Turn replaced by a newer local agent turn".to_owned(),
-                }),
+                MedicalEventMsg::TurnAborted(active_turn.abort(
+                    MedicalTurnAbortReason::ReplacedByNewTurn,
+                    "Turn replaced by a newer local agent turn",
+                )),
             );
         }
 
         if let Err(policy) = validate_turn_request(&request) {
-            self.active_turn_id = None;
             self.set_status(MedicalAgentStatus::Idle);
             self.emit(
                 Some(submission_id),
@@ -290,37 +281,127 @@ impl MedicalSessionLoop {
             return;
         }
 
+        let mut turn = ActiveMedicalTurn::new(turn_id, &request, OffsetDateTime::now_utc());
         self.set_status(MedicalAgentStatus::Running);
         self.emit(
             Some(submission_id.clone()),
-            MedicalEventMsg::TurnStarted(MedicalTurnStartedEvent {
-                turn_id: turn_id.clone(),
-                patient_id: request.patient_id,
-                encounter_id: request.encounter_id,
-                note_id: request.note_id,
-                contains_phi: request.contains_phi,
-                loop_limits: request.loop_limits,
-            }),
+            MedicalEventMsg::TurnStarted(turn.started_event()),
         );
 
-        self.emit(
+        if let Some(approval_class) = turn_approval_class(&request) {
+            let approval = turn.request_approval(
+                approval_class,
+                approval_reason(approval_class),
+                OffsetDateTime::now_utc(),
+            );
+            self.active_turn = Some(turn);
+            self.set_status(MedicalAgentStatus::WaitingForApproval);
+            self.emit(
+                Some(submission_id),
+                MedicalEventMsg::ApprovalRequested(approval),
+            );
+            return;
+        }
+
+        self.active_turn = Some(turn);
+        self.complete_active_turn(
             Some(submission_id),
-            MedicalEventMsg::TurnComplete(MedicalTurnCompleteEvent {
-                turn_id: turn_id.clone(),
-                steps_completed: 0,
-                redacted_summary:
-                    "Local medical agent turn accepted; model/tool execution is not attached yet"
-                        .to_owned(),
-            }),
+            "Local medical agent turn accepted; model/tool execution is not attached yet",
         );
-        self.active_turn_id = None;
+    }
+
+    fn resolve_approval(
+        &mut self,
+        submission_id: String,
+        response: crate::MedicalApprovalResponse,
+    ) {
+        let Some(turn) = self.active_turn.as_mut() else {
+            self.emit(
+                Some(submission_id),
+                MedicalEventMsg::Error(MedicalAgentErrorEvent {
+                    redacted_message: "No active medical turn is waiting for approval".to_owned(),
+                }),
+            );
+            return;
+        };
+
+        let decision = response.decision;
+        match turn.resolve_approval(&response) {
+            Ok(event) => {
+                self.emit(
+                    Some(submission_id.clone()),
+                    MedicalEventMsg::ApprovalResolved(event),
+                );
+            }
+            Err(error) => {
+                self.emit(
+                    Some(submission_id),
+                    MedicalEventMsg::Error(MedicalAgentErrorEvent {
+                        redacted_message: active_turn_error_summary(&error).to_owned(),
+                    }),
+                );
+                return;
+            }
+        }
+
+        match decision {
+            MedicalReviewDecision::Approved | MedicalReviewDecision::ApprovedForTurn => {
+                self.set_status(MedicalAgentStatus::Running);
+                self.complete_active_turn(
+                    Some(submission_id),
+                    "Approved medical agent action; model/tool execution is not attached yet",
+                );
+            }
+            MedicalReviewDecision::Denied | MedicalReviewDecision::AbortTurn => {
+                self.abort_active_turn(
+                    Some(submission_id),
+                    MedicalTurnAbortReason::PolicyBlocked,
+                    "Human denied the pending medical agent action",
+                );
+            }
+        }
+    }
+
+    fn complete_active_turn(&mut self, submission_id: Option<String>, redacted_summary: &str) {
+        let Some(mut turn) = self.active_turn.take() else {
+            return;
+        };
+        self.emit(
+            submission_id,
+            MedicalEventMsg::TurnComplete(turn.complete(redacted_summary)),
+        );
+        self.set_status(MedicalAgentStatus::Idle);
+    }
+
+    fn abort_active_turn(
+        &mut self,
+        submission_id: Option<String>,
+        reason: MedicalTurnAbortReason,
+        redacted_summary: &str,
+    ) {
+        let Some(mut turn) = self.active_turn.take() else {
+            return;
+        };
+        self.emit(
+            submission_id,
+            MedicalEventMsg::TurnAborted(turn.abort(reason, redacted_summary)),
+        );
         self.set_status(MedicalAgentStatus::Idle);
     }
 
     fn cancel_turn(&mut self, submission_id: String, turn_id: String, reason: String) {
         self.set_status(MedicalAgentStatus::Cancelling);
-        if self.active_turn_id.as_deref() == Some(turn_id.as_str()) {
-            self.active_turn_id = None;
+        if let Some(mut turn) = self.active_turn.take() {
+            if turn.turn_id == turn_id {
+                self.emit(
+                    Some(submission_id),
+                    MedicalEventMsg::TurnAborted(turn.cancel(reason)),
+                );
+                self.set_status(MedicalAgentStatus::Idle);
+                return;
+            }
+
+            self.active_turn = Some(turn);
         }
 
         self.emit(
@@ -382,6 +463,64 @@ fn policy_block_summary(policy: MedicalPolicyBlock) -> &'static str {
     }
 }
 
+fn turn_approval_class(request: &MedicalTurnRequest) -> Option<MedicalApprovalClass> {
+    if request.provider.is_some() && request.contains_phi {
+        return Some(MedicalApprovalClass::OutboundPhi);
+    }
+
+    request.requested_tools.iter().find_map(|tool| match tool {
+        MedicalToolName::ObserveDesktopTarget
+        | MedicalToolName::ProposeDesktopAction
+        | MedicalToolName::VerifyDesktopState => Some(MedicalApprovalClass::DesktopAutomation),
+        MedicalToolName::PrepareSuperbillDraft => Some(MedicalApprovalClass::BillingSupportExport),
+        _ => None,
+    })
+}
+
+fn approval_reason(class: MedicalApprovalClass) -> &'static str {
+    match class {
+        MedicalApprovalClass::OutboundPhi => {
+            "Outbound PHI requires an executed BAA and human approval"
+        }
+        MedicalApprovalClass::DesktopAutomation => {
+            "Local desktop automation requires human approval"
+        }
+        MedicalApprovalClass::BillingSupportExport => {
+            "Billing-support export or finalization requires human review"
+        }
+        MedicalApprovalClass::SignedClinicalChange => {
+            "Signing or finalizing a clinical note requires human confirmation"
+        }
+        MedicalApprovalClass::DestructiveLocalWrite => {
+            "Destructive local writes require human confirmation"
+        }
+        MedicalApprovalClass::BulkImport => "Bulk import requires human confirmation",
+        MedicalApprovalClass::BulkExport => "Bulk export requires human confirmation",
+        MedicalApprovalClass::PluginInstall => "Plugin installation requires human confirmation",
+    }
+}
+
+fn active_turn_error_summary(error: &ActiveMedicalTurnError) -> &'static str {
+    match error {
+        ActiveMedicalTurnError::ApprovalNotPending { .. } => {
+            "Approval response did not match a pending approval"
+        }
+        ActiveMedicalTurnError::TurnMismatch { .. } => {
+            "Approval response did not match the active turn"
+        }
+        ActiveMedicalTurnError::LoopStepLimitExceeded { .. } => {
+            "Medical agent turn exceeded its step limit"
+        }
+        ActiveMedicalTurnError::WallClockLimitExceeded { .. } => {
+            "Medical agent turn exceeded its wall-clock limit"
+        }
+        ActiveMedicalTurnError::TurnCancelled { .. } => "Medical agent turn was already cancelled",
+        ActiveMedicalTurnError::ToolCallNotPending { .. } => {
+            "Tool result did not match a pending tool call"
+        }
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MedicalAgentThreadError {
     #[error("medical agent submission channel is closed")]
@@ -413,6 +552,19 @@ mod tests {
             note_id: None,
             contains_phi,
             requested_tools: Vec::new(),
+            provider: None,
+            loop_limits: MedicalLoopLimits::default(),
+        })
+    }
+
+    fn desktop_turn() -> MedicalOp {
+        MedicalOp::StartTurn(MedicalTurnRequest {
+            instruction: "Propose the next local desktop action".to_owned(),
+            patient_id: None,
+            encounter_id: None,
+            note_id: None,
+            contains_phi: false,
+            requested_tools: vec![MedicalToolName::ProposeDesktopAction],
             provider: None,
             loop_limits: MedicalLoopLimits::default(),
         })
@@ -549,6 +701,82 @@ mod tests {
                 ..
             })
         ));
+
+        thread.shutdown_and_wait().unwrap();
+    }
+
+    #[test]
+    fn desktop_turn_waits_for_approval_then_completes() {
+        let thread = MedicalAgentThread::spawn(MedicalAgentThreadConfig::default());
+        let _ = thread.next_event().unwrap();
+        thread.submit(desktop_turn()).unwrap();
+
+        let started = thread.next_event().unwrap();
+        let approval = thread.next_event().unwrap();
+
+        let MedicalEventMsg::TurnStarted(started) = started.msg else {
+            panic!("expected turn started event");
+        };
+        let MedicalEventMsg::ApprovalRequested(approval) = approval.msg else {
+            panic!("expected approval request event");
+        };
+        assert_eq!(approval.turn_id, started.turn_id);
+        assert_eq!(approval.class, MedicalApprovalClass::DesktopAutomation);
+        assert_eq!(thread.status(), MedicalAgentStatus::WaitingForApproval);
+
+        thread
+            .submit(MedicalOp::ApproveAction(crate::MedicalApprovalResponse {
+                approval_id: approval.approval_id,
+                turn_id: approval.turn_id,
+                decided_by: "local-user".to_owned(),
+                decision: MedicalReviewDecision::Approved,
+                redacted_reason: None,
+            }))
+            .unwrap();
+
+        let resolved = thread.next_event().unwrap();
+        let complete = thread.next_event().unwrap();
+
+        assert!(matches!(resolved.msg, MedicalEventMsg::ApprovalResolved(_)));
+        assert!(matches!(complete.msg, MedicalEventMsg::TurnComplete(_)));
+        assert_eq!(thread.status(), MedicalAgentStatus::Idle);
+
+        thread.shutdown_and_wait().unwrap();
+    }
+
+    #[test]
+    fn desktop_turn_denial_aborts_turn() {
+        let thread = MedicalAgentThread::spawn(MedicalAgentThreadConfig::default());
+        let _ = thread.next_event().unwrap();
+        thread.submit(desktop_turn()).unwrap();
+        let _ = thread.next_event().unwrap();
+        let approval = thread.next_event().unwrap();
+
+        let MedicalEventMsg::ApprovalRequested(approval) = approval.msg else {
+            panic!("expected approval request event");
+        };
+        thread
+            .submit(MedicalOp::DenyAction(crate::MedicalApprovalResponse {
+                approval_id: approval.approval_id,
+                turn_id: approval.turn_id,
+                decided_by: "local-user".to_owned(),
+                decision: MedicalReviewDecision::Denied,
+                redacted_reason: Some("Synthetic denial".to_owned()),
+            }))
+            .unwrap();
+
+        let resolved = thread.next_event().unwrap();
+        let aborted = thread.next_event().unwrap();
+
+        assert!(matches!(resolved.msg, MedicalEventMsg::ApprovalResolved(_)));
+        assert!(matches!(
+            aborted.msg,
+            MedicalEventMsg::TurnAborted(MedicalTurnAbortedEvent {
+                reason: MedicalTurnAbortReason::PolicyBlocked,
+                ..
+            })
+        ));
+        assert_eq!(thread.status(), MedicalAgentStatus::Idle);
 
         thread.shutdown_and_wait().unwrap();
     }

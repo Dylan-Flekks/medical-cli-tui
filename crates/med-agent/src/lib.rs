@@ -10,6 +10,7 @@ pub mod desktop;
 pub mod protocol;
 pub mod thread;
 pub mod tools;
+pub mod turn;
 
 pub use desktop::{
     AccessibilityTreeCompleteness, AutomationBounds, CaptureTimePhiHandling, ControlRole,
@@ -42,6 +43,10 @@ pub use tools::{
     MedicalToolInvocation, MedicalToolOutput, MedicalToolPayload, MedicalToolRisk,
     MedicalToolRuntime, MedicalToolRuntimeRegistry, ReadPatientSummaryRequest,
     SaveNoteDraftRequest,
+};
+pub use turn::{
+    ActiveMedicalTurn, ActiveMedicalTurnError, MedicalActiveTurnStatus, MedicalPendingApproval,
+    MedicalPendingToolCall,
 };
 
 #[derive(Debug, Clone)]
