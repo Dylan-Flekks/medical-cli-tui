@@ -41,8 +41,8 @@ pub use thread::{
 pub use tools::{
     MedicalApprovalDecision, MedicalApprovalPolicy, MedicalToolContext, MedicalToolError,
     MedicalToolInvocation, MedicalToolOutput, MedicalToolPayload, MedicalToolRisk,
-    MedicalToolRuntime, MedicalToolRuntimeRegistry, ReadPatientSummaryRequest,
-    RunDocumentationAuditRequest, SaveNoteDraftRequest, SignNoteRequest,
+    MedicalToolRuntime, MedicalToolRuntimeRegistry, PrepareSuperbillDraftRequest,
+    ReadPatientSummaryRequest, RunDocumentationAuditRequest, SaveNoteDraftRequest, SignNoteRequest,
 };
 pub use turn::{
     ActiveMedicalTurn, ActiveMedicalTurnError, MedicalActiveTurnStatus, MedicalPendingApproval,
