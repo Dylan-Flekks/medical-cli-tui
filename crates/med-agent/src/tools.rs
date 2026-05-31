@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use med_core::{
-    audit_documentation, new_id, AuditAction, AuditEvent, ClinicalNote, Encounter, EncounterStatus,
-    NoteId, NoteSection, NoteStatus, NoteTemplate, PatientId, PractitionerId,
+    assess_claim_readiness, audit_documentation, new_id, AuditAction, AuditEvent, ClaimDraft,
+    ClinicalNote, Encounter, EncounterStatus, NoteId, NoteSection, NoteStatus, NoteTemplate,
+    PatientId, PractitionerId,
 };
 use med_store::LocalStore;
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,7 @@ impl MedicalToolRuntimeRegistry {
         registry.register(SaveNoteDraftTool::new(MedicalToolName::UpdateNoteDraft));
         registry.register(SignNoteTool);
         registry.register(RunDocumentationAuditTool);
+        registry.register(PrepareSuperbillDraftTool);
         registry
     }
 
@@ -103,6 +105,7 @@ pub enum MedicalToolPayload {
     SaveNoteDraft(SaveNoteDraftRequest),
     SignNote(SignNoteRequest),
     RunDocumentationAudit(RunDocumentationAuditRequest),
+    PrepareSuperbillDraft(PrepareSuperbillDraftRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +133,13 @@ pub struct SignNoteRequest {
 pub struct RunDocumentationAuditRequest {
     pub patient_id: PatientId,
     pub encounter_id: Option<med_core::EncounterId>,
+    pub note_id: Option<NoteId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareSuperbillDraftRequest {
+    pub patient_id: PatientId,
+    pub encounter_id: med_core::EncounterId,
     pub note_id: Option<NoteId>,
 }
 
@@ -162,6 +172,7 @@ pub struct MedicalApprovalPolicy {
     pub allow_local_draft_writes: bool,
     pub require_human_approval_for_draft_writes: bool,
     pub allow_signed_clinical_changes: bool,
+    pub allow_billing_support_exports: bool,
 }
 
 impl MedicalApprovalPolicy {
@@ -171,12 +182,21 @@ impl MedicalApprovalPolicy {
             allow_local_draft_writes: true,
             require_human_approval_for_draft_writes: false,
             allow_signed_clinical_changes: false,
+            allow_billing_support_exports: false,
         }
     }
 
     pub fn after_human_confirmation() -> Self {
         Self {
             allow_signed_clinical_changes: true,
+            allow_billing_support_exports: true,
+            ..Self::local_default()
+        }
+    }
+
+    pub fn after_billing_confirmation() -> Self {
+        Self {
+            allow_billing_support_exports: true,
             ..Self::local_default()
         }
     }
@@ -187,6 +207,7 @@ impl MedicalApprovalPolicy {
             allow_local_draft_writes: false,
             require_human_approval_for_draft_writes: false,
             allow_signed_clinical_changes: false,
+            allow_billing_support_exports: false,
         }
     }
 
@@ -204,6 +225,9 @@ impl MedicalApprovalPolicy {
             }
             MedicalToolRisk::LocalDraftWrite => MedicalApprovalDecision::Allowed,
             MedicalToolRisk::SignedClinicalChange if self.allow_signed_clinical_changes => {
+                MedicalApprovalDecision::Allowed
+            }
+            MedicalToolRisk::BillingSupportExport if self.allow_billing_support_exports => {
                 MedicalApprovalDecision::Allowed
             }
             MedicalToolRisk::OutboundPhi
@@ -613,6 +637,104 @@ impl MedicalToolRuntime for RunDocumentationAuditTool {
     }
 }
 
+struct PrepareSuperbillDraftTool;
+
+impl MedicalToolRuntime for PrepareSuperbillDraftTool {
+    fn name(&self) -> MedicalToolName {
+        MedicalToolName::PrepareSuperbillDraft
+    }
+
+    fn risk_profile(&self) -> MedicalToolRisk {
+        MedicalToolRisk::BillingSupportExport
+    }
+
+    fn handle(
+        &self,
+        invocation: MedicalToolInvocation<'_>,
+    ) -> Result<MedicalToolOutput, MedicalToolError> {
+        let MedicalToolPayload::PrepareSuperbillDraft(request) = invocation.payload else {
+            return Err(MedicalToolError::InvalidPayload {
+                tool: invocation.tool_name,
+                expected: "PrepareSuperbillDraft",
+            });
+        };
+
+        invocation
+            .store
+            .get_patient(request.patient_id)?
+            .ok_or(MedicalToolError::PatientNotFound(request.patient_id))?;
+
+        let audit_request = RunDocumentationAuditRequest {
+            patient_id: request.patient_id,
+            encounter_id: Some(request.encounter_id),
+            note_id: request.note_id,
+        };
+        let encounter = load_requested_encounter(invocation.store, &audit_request)?.ok_or(
+            MedicalToolError::EncounterNotFound {
+                patient_id: request.patient_id,
+                encounter_id: request.encounter_id,
+            },
+        )?;
+        let note = load_requested_note(invocation.store, &audit_request, Some(&encounter))?;
+        let documentation_audit = audit_documentation(
+            request.patient_id,
+            Some(&encounter),
+            note.as_ref(),
+            OffsetDateTime::now_utc(),
+        );
+        let mut claim = invocation
+            .store
+            .get_claim_draft(request.encounter_id)?
+            .unwrap_or_else(|| ClaimDraft::placeholder(request.patient_id, request.encounter_id));
+
+        claim.ensure_placeholders();
+        let readiness = assess_claim_readiness(&claim, note.as_ref(), Some(&documentation_audit));
+        claim.status = readiness.status.clone();
+        invocation.store.upsert_claim_draft(&claim)?;
+
+        let audit_event_id = append_tool_audit(
+            invocation.store,
+            AuditAction::BillingDraftPrepared,
+            invocation.context.actor_id,
+            Some(claim.patient_id),
+            Some(claim.encounter_id),
+            note.as_ref().map(|note| note.id),
+            json!({
+                "tool": invocation.tool_name.as_str(),
+                "call_id": invocation.call_id.clone(),
+                "diagnosis_count": claim.diagnoses.len(),
+                "procedure_count": claim.procedures.len(),
+                "readiness_status": format!("{:?}", readiness.status),
+                "readiness_flag_count": readiness.flags.len()
+            }),
+        )?;
+
+        Ok(MedicalToolOutput {
+            call_id: invocation.call_id,
+            tool_name: invocation.tool_name,
+            success: true,
+            model_summary: format!(
+                "Prepared local superbill draft with {} diagnoses, {} procedures, and {} readiness flags.",
+                claim.diagnoses.len(),
+                claim.procedures.len(),
+                readiness.flags.len()
+            ),
+            tui_summary: format!(
+                "Prepared superbill draft: {} diagnoses, {} procedures, {:?}",
+                claim.diagnoses.len(),
+                claim.procedures.len(),
+                readiness.status
+            ),
+            structured: json!({
+                "claim": claim,
+                "readiness": readiness,
+                "documentation_audit": documentation_audit
+            }),
+            audit_event_id: Some(audit_event_id),
+        })
+    }
+}
+
 fn load_requested_encounter(
     store: &LocalStore,
     request: &RunDocumentationAuditRequest,
@@ -922,6 +1044,75 @@ mod tests {
             .flags
             .iter()
             .any(|flag| flag.code == "missing_section_objective"));
+        assert_eq!(store.audit_event_count().unwrap(), before + 1);
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn default_policy_requires_human_approval_for_superbill_draft() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) = insert_patient_and_encounter(&store);
+        let registry = MedicalToolRuntimeRegistry::default();
+
+        let result = registry.dispatch(MedicalToolInvocation {
+            store: &store,
+            call_id: "call-superbill-blocked".to_owned(),
+            tool_name: MedicalToolName::PrepareSuperbillDraft,
+            payload: MedicalToolPayload::PrepareSuperbillDraft(PrepareSuperbillDraftRequest {
+                patient_id,
+                encounter_id,
+                note_id: None,
+            }),
+            context: MedicalToolContext::default(),
+            approval_policy: MedicalApprovalPolicy::local_default(),
+        });
+
+        assert!(matches!(
+            result,
+            Err(MedicalToolError::ApprovalRequired(
+                MedicalToolName::PrepareSuperbillDraft
+            ))
+        ));
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn prepare_superbill_draft_creates_claim_and_writes_audit_event() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) = insert_patient_and_encounter(&store);
+        let note_id = insert_note_draft(&store, patient_id, encounter_id);
+        let registry = MedicalToolRuntimeRegistry::default();
+
+        let before = store.audit_event_count().unwrap();
+        let output = registry
+            .dispatch(MedicalToolInvocation {
+                store: &store,
+                call_id: "call-superbill-draft".to_owned(),
+                tool_name: MedicalToolName::PrepareSuperbillDraft,
+                payload: MedicalToolPayload::PrepareSuperbillDraft(PrepareSuperbillDraftRequest {
+                    patient_id,
+                    encounter_id,
+                    note_id: Some(note_id),
+                }),
+                context: MedicalToolContext::default(),
+                approval_policy: MedicalApprovalPolicy::after_billing_confirmation(),
+            })
+            .unwrap();
+        let claim = store.get_claim_draft(encounter_id).unwrap().unwrap();
+
+        assert!(output.success);
+        assert_eq!(claim.diagnoses.len(), 1);
+        assert_eq!(claim.diagnoses[0].code, "TBD");
+        assert_eq!(claim.procedures.len(), 1);
+        assert_eq!(claim.procedures[0].code, "TBD");
+        assert!(matches!(
+            claim.status,
+            med_core::ClaimDraftStatus::NeedsReview
+        ));
         assert_eq!(store.audit_event_count().unwrap(), before + 1);
 
         drop(store);

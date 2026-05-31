@@ -7,7 +7,11 @@ pub use audit::{
     audit_documentation, AuditAction, AuditEvent, DocumentationAuditFlag, DocumentationAuditReport,
     DocumentationAuditSeverity,
 };
-pub use billing::{BillingAuditFlag, ClaimDraft, DiagnosisCode, ProcedureCode};
+pub use billing::{
+    assess_claim_readiness, BillingAuditFlag, ClaimDraft, ClaimDraftStatus, ClaimReadinessFlag,
+    ClaimReadinessReport, ClaimReadinessSeverity, DiagnosisCode, DiagnosisSystem, ProcedureCode,
+    ProcedureSystem,
+};
 pub use clinical::{
     Allergy, ClinicalNote, Encounter, EncounterStatus, EncounterType, Medication, NoteSection,
     NoteStatus, NoteTemplate, Observation, Patient, Problem,

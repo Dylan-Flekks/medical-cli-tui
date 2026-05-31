@@ -26,6 +26,7 @@ pub enum AuditAction {
     NoteSigned,
     NoteAmended,
     DocumentationAuditRan,
+    BillingDraftPrepared,
     BillingCodeChanged,
     ExportCreated,
     BackupCreated,

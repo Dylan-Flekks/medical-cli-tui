@@ -67,6 +67,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         if let Some(signed_at) = &app.note_signed_at {
             spans.extend([format!(" signed: {signed_at} ").black().on_dark_gray()]);
         }
+    } else if app.selected_tab == WorkspaceTab::Billing {
+        spans.extend([" b ".black().on_cyan(), " superbill  ".into()]);
     }
 
     spans.extend([

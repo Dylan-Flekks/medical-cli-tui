@@ -7,12 +7,14 @@ use med_agent::{
     MedicalApprovalResponse, MedicalEvent, MedicalEventMsg, MedicalLoopLimits, MedicalOp,
     MedicalReviewDecision, MedicalToolContext, MedicalToolInvocation, MedicalToolName,
     MedicalToolPayload, MedicalToolRuntimeRegistry, MedicalTurnAbortReason, MedicalTurnRequest,
-    SaveNoteDraftRequest, SignNoteRequest,
+    PrepareSuperbillDraftRequest, SaveNoteDraftRequest, SignNoteRequest,
 };
 use med_core::{
-    audit_documentation, new_id, ClinicalNote, DocumentationAuditFlag, DocumentationAuditReport,
-    DocumentationAuditSeverity, Encounter, EncounterId, EncounterStatus, EncounterType, NoteId,
-    NoteSection, NoteStatus, NoteTemplate, Patient, PatientId,
+    assess_claim_readiness, audit_documentation, new_id, ClaimDraft, ClaimReadinessFlag,
+    ClaimReadinessSeverity, ClinicalNote, DiagnosisSystem, DocumentationAuditFlag,
+    DocumentationAuditReport, DocumentationAuditSeverity, Encounter, EncounterId, EncounterStatus,
+    EncounterType, NoteId, NoteSection, NoteStatus, NoteTemplate, Patient, PatientId,
+    ProcedureSystem,
 };
 use med_store::LocalStore;
 use time::{Date, OffsetDateTime};
@@ -125,6 +127,11 @@ impl App {
 
         if self.note_editor_active() && is_note_editor_input_key(key) {
             self.note_dirty |= self.note_editor.input(note_editor_input(key));
+            return Ok(());
+        }
+
+        if self.selected_tab == WorkspaceTab::Billing && matches!(key.code, KeyCode::Char('b')) {
+            self.prepare_superbill_draft(store)?;
             return Ok(());
         }
 
@@ -713,6 +720,12 @@ impl App {
         );
 
         self.apply_documentation_audit_report(&report);
+        let claim = encounter
+            .as_ref()
+            .map(|encounter| store.get_claim_draft(encounter.id))
+            .transpose()?
+            .flatten();
+        self.apply_billing_workbench(claim.as_ref(), note.as_ref(), &report);
         Ok(())
     }
 
@@ -727,6 +740,45 @@ impl App {
                 .collect()
         };
         self.data.billing_ready_percent = report.billing_ready_percent;
+    }
+
+    fn apply_billing_workbench(
+        &mut self,
+        claim: Option<&ClaimDraft>,
+        note: Option<&ClinicalNote>,
+        documentation_audit: &DocumentationAuditReport,
+    ) {
+        self.data.billing_rows = billing_rows_from_claim(claim, note, documentation_audit);
+    }
+
+    fn prepare_superbill_draft(&mut self, store: &LocalStore) -> Result<()> {
+        let Some(patient_id) = self.active_patient().map(|patient| patient.id) else {
+            self.last_message = "Select a patient before preparing billing".to_owned();
+            return Ok(());
+        };
+        let Some(encounter_id) = self.active_encounter().map(|encounter| encounter.id) else {
+            self.last_message = "Create an encounter before preparing billing".to_owned();
+            return Ok(());
+        };
+
+        let registry = MedicalToolRuntimeRegistry::default();
+        let output = registry.dispatch(MedicalToolInvocation {
+            store,
+            call_id: format!("tui-superbill-{}", short_id(new_id())),
+            tool_name: med_agent::MedicalToolName::PrepareSuperbillDraft,
+            payload: MedicalToolPayload::PrepareSuperbillDraft(PrepareSuperbillDraftRequest {
+                patient_id,
+                encounter_id,
+                note_id: self.note_draft_id,
+            }),
+            context: MedicalToolContext::default(),
+            approval_policy: MedicalApprovalPolicy::after_billing_confirmation(),
+        })?;
+
+        self.refresh_documentation_audit(store)?;
+        self.last_message = output.tui_summary;
+
+        Ok(())
     }
 
     fn arm_note_signing(&mut self) {
@@ -1277,6 +1329,67 @@ pub struct BillingRow {
     pub status: String,
 }
 
+fn billing_rows_from_claim(
+    claim: Option<&ClaimDraft>,
+    note: Option<&ClinicalNote>,
+    documentation_audit: &DocumentationAuditReport,
+) -> Vec<BillingRow> {
+    let Some(claim) = claim else {
+        return vec![BillingRow {
+            code: "Draft".to_owned(),
+            kind: "Superbill".to_owned(),
+            status: if documentation_audit.encounter_id.is_some() {
+                "press b to prepare".to_owned()
+            } else {
+                "no active encounter".to_owned()
+            },
+        }];
+    };
+
+    let readiness = assess_claim_readiness(claim, note, Some(documentation_audit));
+    let mut rows = vec![BillingRow {
+        code: "Readiness".to_owned(),
+        kind: "Claim".to_owned(),
+        status: format!("{:?}", readiness.status),
+    }];
+
+    rows.extend(claim.diagnoses.iter().map(|diagnosis| {
+        BillingRow {
+            code: diagnosis.code.clone(),
+            kind: diagnosis_system_label(&diagnosis.system).to_owned(),
+            status: diagnosis
+                .description
+                .clone()
+                .unwrap_or_else(|| "requires review".to_owned()),
+        }
+    }));
+    rows.extend(claim.procedures.iter().map(|procedure| {
+        BillingRow {
+            code: procedure.code.clone(),
+            kind: procedure_system_label(&procedure.system).to_owned(),
+            status: procedure
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("{} unit(s)", procedure.units)),
+        }
+    }));
+    rows.extend(readiness.flags.iter().map(readiness_flag_row));
+
+    rows
+}
+
+fn readiness_flag_row(flag: &ClaimReadinessFlag) -> BillingRow {
+    BillingRow {
+        code: flag.code.clone(),
+        kind: "Checklist".to_owned(),
+        status: format!(
+            "{}: {}",
+            readiness_severity_label(flag.severity),
+            flag.message
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Severity {
     Info,
@@ -1401,6 +1514,29 @@ fn medical_agent_status_label(status: MedicalAgentStatus) -> &'static str {
         MedicalAgentStatus::Cancelling => "cancelling",
         MedicalAgentStatus::ShuttingDown => "shutdown",
         MedicalAgentStatus::Stopped => "stopped",
+    }
+}
+
+fn diagnosis_system_label(system: &DiagnosisSystem) -> &str {
+    match system {
+        DiagnosisSystem::Icd10Cm => "ICD-10-CM",
+        DiagnosisSystem::Other(label) => label.as_str(),
+    }
+}
+
+fn procedure_system_label(system: &ProcedureSystem) -> &str {
+    match system {
+        ProcedureSystem::Cpt => "CPT",
+        ProcedureSystem::Hcpcs => "HCPCS",
+        ProcedureSystem::Other(label) => label.as_str(),
+    }
+}
+
+fn readiness_severity_label(severity: ClaimReadinessSeverity) -> &'static str {
+    match severity {
+        ClaimReadinessSeverity::Info => "info",
+        ClaimReadinessSeverity::Warning => "warning",
+        ClaimReadinessSeverity::Error => "blocked",
     }
 }
 
@@ -1871,6 +2007,11 @@ mod tests {
             .audit_flags
             .iter()
             .any(|flag| flag.message == "No clinical note exists for the active encounter"));
+        assert!(app
+            .data
+            .billing_rows
+            .iter()
+            .any(|row| row.status == "press b to prepare"));
 
         drop(store);
         cleanup(path);
@@ -2339,6 +2480,61 @@ mod tests {
         assert!(app.data.audit_flags.iter().any(|flag| {
             flag.message == "Signed note is immutable and ready for billing review"
         }));
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn billing_key_prepares_superbill_draft_for_active_encounter() {
+        let (store, path) = temp_store();
+        let mut app = App::from_store(&store).unwrap();
+
+        app.handle_key_with_store(key(KeyCode::Char('n')), &store)
+            .unwrap();
+        app.handle_key_with_store(key(KeyCode::Char('e')), &store)
+            .unwrap();
+        app.selected_tab = WorkspaceTab::Note;
+        app.focus = FocusArea::Workspace;
+        app.note_editor = TextArea::from([
+            "Subjective:",
+            "Patient reports improvement",
+            "Objective:",
+            "Vitals stable",
+            "Assessment:",
+            "Improving",
+            "Plan:",
+            "Continue current plan",
+        ]);
+        app.note_dirty = true;
+        app.handle_key_with_store(ctrl_key(KeyCode::Char('s')), &store)
+            .unwrap();
+        app.handle_key_with_store(key(KeyCode::Char('S')), &store)
+            .unwrap();
+        app.handle_key_with_store(key(KeyCode::Char('S')), &store)
+            .unwrap();
+
+        let encounter_id = app.active_encounter().unwrap().id;
+        let before = store.audit_event_count().unwrap();
+        app.selected_tab = WorkspaceTab::Billing;
+        app.handle_key_with_store(key(KeyCode::Char('b')), &store)
+            .unwrap();
+
+        let claim = store.get_claim_draft(encounter_id).unwrap().unwrap();
+
+        assert_eq!(claim.diagnoses[0].code, "TBD");
+        assert_eq!(claim.procedures[0].code, "TBD");
+        assert_eq!(store.audit_event_count().unwrap(), before + 1);
+        assert!(app
+            .data
+            .billing_rows
+            .iter()
+            .any(|row| row.kind == "ICD-10-CM" && row.code == "TBD"));
+        assert!(app
+            .data
+            .billing_rows
+            .iter()
+            .any(|row| row.kind == "Checklist" && row.code == "diagnosis_placeholder"));
 
         drop(store);
         cleanup(path);

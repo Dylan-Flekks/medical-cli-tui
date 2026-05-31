@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use med_core::{
-    AuditEvent, ClinicalNote, Encounter, EncounterStatus, EncounterType, NoteId, NoteSection,
-    NoteStatus, NoteTemplate, Patient, PatientId, PractitionerId,
+    AuditEvent, ClaimDraft, ClaimDraftStatus, ClinicalNote, DiagnosisCode, Encounter,
+    EncounterStatus, EncounterType, NoteId, NoteSection, NoteStatus, NoteTemplate, Patient,
+    PatientId, PractitionerId, ProcedureCode,
 };
 use rusqlite::{params, Connection, OpenFlags};
 use thiserror::Error;
@@ -475,6 +476,56 @@ impl LocalStore {
                 .query_row("select count(*) from audit_events", [], |row| row.get(0))?;
         Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
+
+    pub fn upsert_claim_draft(&self, claim: &ClaimDraft) -> StoreResult<()> {
+        self.connection.execute(
+            "insert into claim_drafts (
+                encounter_id, patient_id, diagnoses_json, procedures_json,
+                place_of_service, rendering_provider_npi, payer_name, status, updated_at
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            on conflict(encounter_id) do update set
+                patient_id = excluded.patient_id,
+                diagnoses_json = excluded.diagnoses_json,
+                procedures_json = excluded.procedures_json,
+                place_of_service = excluded.place_of_service,
+                rendering_provider_npi = excluded.rendering_provider_npi,
+                payer_name = excluded.payer_name,
+                status = excluded.status,
+                updated_at = excluded.updated_at",
+            params![
+                claim.encounter_id.to_string(),
+                claim.patient_id.to_string(),
+                serde_json::to_string(&claim.diagnoses)?,
+                serde_json::to_string(&claim.procedures)?,
+                claim.place_of_service.as_deref(),
+                claim.rendering_provider_npi.as_deref(),
+                claim.payer_name.as_deref(),
+                serde_json::to_string(&claim.status)?,
+                format_offset_date_time(OffsetDateTime::now_utc())?,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn get_claim_draft(
+        &self,
+        encounter_id: med_core::EncounterId,
+    ) -> StoreResult<Option<ClaimDraft>> {
+        let mut statement = self.connection.prepare(
+            "select patient_id, encounter_id, diagnoses_json, procedures_json,
+                    place_of_service, rendering_provider_npi, payer_name, status
+             from claim_drafts
+             where encounter_id = ?1",
+        )?;
+        let mut rows = statement.query(params![encounter_id.to_string()])?;
+
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+
+        claim_draft_from_row(row).map(Some)
+    }
 }
 
 fn patient_from_row(row: &rusqlite::Row<'_>) -> StoreResult<Patient> {
@@ -515,6 +566,25 @@ fn encounter_from_row(row: &rusqlite::Row<'_>) -> StoreResult<Encounter> {
             .map(parse_offset_date_time)
             .transpose()?,
         reason: row.get(7)?,
+    })
+}
+
+fn claim_draft_from_row(row: &rusqlite::Row<'_>) -> StoreResult<ClaimDraft> {
+    let patient_id: String = row.get(0)?;
+    let encounter_id: String = row.get(1)?;
+    let diagnoses_json: String = row.get(2)?;
+    let procedures_json: String = row.get(3)?;
+    let status: String = row.get(7)?;
+
+    Ok(ClaimDraft {
+        patient_id: parse_uuid(&patient_id)?,
+        encounter_id: parse_uuid(&encounter_id)?,
+        diagnoses: serde_json::from_str::<Vec<DiagnosisCode>>(&diagnoses_json)?,
+        procedures: serde_json::from_str::<Vec<ProcedureCode>>(&procedures_json)?,
+        place_of_service: row.get(4)?,
+        rendering_provider_npi: row.get(5)?,
+        payer_name: row.get(6)?,
+        status: serde_json::from_str::<ClaimDraftStatus>(&status)?,
     })
 }
 
@@ -640,6 +710,18 @@ create table if not exists audit_events (
     occurred_at text not null,
     details_json text not null
 );
+
+create table if not exists claim_drafts (
+    encounter_id text primary key references encounters(id),
+    patient_id text not null references patients(id),
+    diagnoses_json text not null,
+    procedures_json text not null,
+    place_of_service text,
+    rendering_provider_npi text,
+    payer_name text,
+    status text not null,
+    updated_at text not null
+);
 "#;
 
 #[cfg(test)]
@@ -714,6 +796,46 @@ mod tests {
             encounters[0].encounter_type,
             EncounterType::OfficeVisit
         ));
+    }
+
+    #[test]
+    fn stores_and_updates_claim_draft_for_encounter() {
+        let store = open_test_store();
+        let now = OffsetDateTime::now_utc();
+        let patient = Patient {
+            id: new_id(),
+            medical_record_number: None,
+            display_name: "Billing Test Patient".to_owned(),
+            date_of_birth: None,
+            sex_at_birth: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let encounter = Encounter {
+            id: new_id(),
+            patient_id: patient.id,
+            practitioner_id: None,
+            encounter_type: EncounterType::OfficeVisit,
+            status: EncounterStatus::InProgress,
+            started_at: now,
+            ended_at: None,
+            reason: Some("Synthetic billing review".to_owned()),
+        };
+        let mut claim = ClaimDraft::placeholder(patient.id, encounter.id);
+
+        store.insert_patient(&patient).unwrap();
+        store.insert_encounter(&encounter).unwrap();
+        store.upsert_claim_draft(&claim).unwrap();
+        claim.diagnoses[0].code = "M54.50".to_owned();
+        claim.status = ClaimDraftStatus::Ready;
+        store.upsert_claim_draft(&claim).unwrap();
+
+        let loaded = store.get_claim_draft(encounter.id).unwrap().unwrap();
+
+        assert_eq!(loaded.patient_id, patient.id);
+        assert_eq!(loaded.encounter_id, encounter.id);
+        assert_eq!(loaded.diagnoses[0].code, "M54.50");
+        assert_eq!(loaded.status, ClaimDraftStatus::Ready);
     }
 
     #[test]
