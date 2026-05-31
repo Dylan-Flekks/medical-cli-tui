@@ -7,6 +7,8 @@ use thiserror::Error;
 use time::{Date, OffsetDateTime};
 
 pub mod desktop;
+pub mod protocol;
+pub mod thread;
 pub mod tools;
 
 pub use desktop::{
@@ -21,6 +23,19 @@ pub use desktop::{
     DesktopVerificationRequest, DesktopVerificationStatus, DesktopVerifier, IrreversibleActionKind,
     PhiCapturePolicy, ScreenRect, SemanticActionCapability, SensitiveValueRef,
     VisualFallbackCapability,
+};
+pub use protocol::{
+    MedicalAgentErrorEvent, MedicalAgentStatus, MedicalApprovalClass, MedicalApprovalRequest,
+    MedicalApprovalResolvedEvent, MedicalApprovalResponse, MedicalEvent, MedicalEventMsg,
+    MedicalLoopLimits, MedicalOp, MedicalPolicyBlock, MedicalPolicyBlockedEvent,
+    MedicalProviderUse, MedicalReviewDecision, MedicalSessionConfiguredEvent, MedicalSubmission,
+    MedicalToolLifecycleEvent, MedicalTurnAbortReason, MedicalTurnAbortedEvent,
+    MedicalTurnCompleteEvent, MedicalTurnRequest, MedicalTurnStartedEvent, MedicalTurnStepEvent,
+    ProviderBaaStatus,
+};
+pub use thread::{
+    MedicalAgentConfigSnapshot, MedicalAgentThread, MedicalAgentThreadConfig,
+    MedicalAgentThreadError,
 };
 pub use tools::{
     MedicalApprovalDecision, MedicalApprovalPolicy, MedicalToolContext, MedicalToolError,

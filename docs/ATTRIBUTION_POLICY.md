@@ -17,7 +17,8 @@ When source code is copied, translated, or closely derived from another project,
 
 ## Current Codex Usage
 
-OpenAI Codex CLI is used as an architecture reference only.
+OpenAI Codex CLI is used as both an architecture reference and a small,
+attributed source-code donor for the medical agent harness.
 
 Current Codex-inspired ideas:
 
@@ -28,11 +29,16 @@ Current Codex-inspired ideas:
 - require explicit approval/policy checks for risky actions
 - keep terminal UI state separate from model/tool runtime
 - test terminal rendering and state transitions
+- submission/event queue protocol shape
+- thread handle methods for `submit`, `next_event`, status snapshots, and shutdown
 
-No Codex source files are currently copied into this repository.
+Codex-derived files are tracked in `docs/CODEX_EXTRACTION_LOG.md`.
+Each derived source file must include a file-level notice naming the upstream
+repository, upstream commit, upstream file path, Apache-2.0 license, and Flekks
+modification summary.
 
 The planned extraction workflow is documented in `docs/CODEX_EXTRACTION_PLAN.md`.
-Any future copied or closely derived files must be recorded in
+Any future copied or closely derived files must also be recorded in
 `docs/CODEX_EXTRACTION_LOG.md` before merging.
 
 ## Medical Safety Override

@@ -6,7 +6,9 @@ OpenAI Codex CLI repository: <https://github.com/openai/codex>
 
 License: Apache-2.0.
 
-Current Flekks status: no Codex source files are copied into this repository yet.
+Current Flekks status: small Codex-derived harness files have been copied and
+adapted into `crates/med-agent` with Apache-2.0 attribution. See
+`docs/CODEX_EXTRACTION_LOG.md`.
 
 ## Strategic Decision
 

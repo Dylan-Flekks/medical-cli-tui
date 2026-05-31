@@ -8,7 +8,7 @@ Repository: <https://github.com/openai/codex>
 
 License: Apache-2.0.
 
-Status for Flekks EMR CLI: strong architecture reference.
+Status for Flekks EMR CLI: strong architecture reference and attributed source-code donor for selected harness pieces.
 
 Useful patterns observed in the Rust implementation:
 
@@ -22,7 +22,7 @@ Useful patterns observed in the Rust implementation:
 - TUI state separated from core execution
 - extensive snapshot and state-transition tests
 
-Current usage: reference only. No Codex source files are copied.
+Current usage: selected Codex-derived protocol/thread-handle code is copied and adapted with Apache-2.0 attribution. See `NOTICE` and `docs/CODEX_EXTRACTION_LOG.md`.
 
 Extraction plan: `docs/CODEX_EXTRACTION_PLAN.md`.
 

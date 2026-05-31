@@ -98,7 +98,9 @@ This report maps `codex-rs/core`:
 - cancellation path
 - event stream
 
-No Codex source files have been copied into Flekks EMR CLI.
+At the time of this inventory report, no Codex source files had been copied into
+Flekks EMR CLI. The current copied-code status is tracked in
+`docs/CODEX_EXTRACTION_LOG.md`.
 
 ## Report 02
 
