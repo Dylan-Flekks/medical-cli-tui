@@ -474,6 +474,7 @@ fn turn_approval_class(request: &MedicalTurnRequest) -> Option<MedicalApprovalCl
         MedicalToolName::ObserveDesktopTarget
         | MedicalToolName::ProposeDesktopAction
         | MedicalToolName::VerifyDesktopState => Some(MedicalApprovalClass::DesktopAutomation),
+        MedicalToolName::SignNote => Some(MedicalApprovalClass::SignedClinicalChange),
         MedicalToolName::PrepareSuperbillDraft => Some(MedicalApprovalClass::BillingSupportExport),
         _ => None,
     })
@@ -567,6 +568,19 @@ mod tests {
             note_id: None,
             contains_phi: false,
             requested_tools: vec![MedicalToolName::ProposeDesktopAction],
+            provider: None,
+            loop_limits: MedicalLoopLimits::default(),
+        })
+    }
+
+    fn note_signing_turn() -> MedicalOp {
+        MedicalOp::StartTurn(MedicalTurnRequest {
+            instruction: "Review a signed clinical note change".to_owned(),
+            patient_id: None,
+            encounter_id: None,
+            note_id: None,
+            contains_phi: false,
+            requested_tools: vec![MedicalToolName::SignNote],
             provider: None,
             loop_limits: MedicalLoopLimits::default(),
         })
@@ -742,6 +756,24 @@ mod tests {
         assert!(matches!(resolved.msg, MedicalEventMsg::ApprovalResolved(_)));
         assert!(matches!(complete.msg, MedicalEventMsg::TurnComplete(_)));
         assert_eq!(thread.status(), MedicalAgentStatus::Idle);
+
+        thread.shutdown_and_wait().unwrap();
+    }
+
+    #[test]
+    fn note_signing_turn_waits_for_signed_change_approval() {
+        let thread = MedicalAgentThread::spawn(MedicalAgentThreadConfig::default());
+        let _ = thread.next_event().unwrap();
+        thread.submit(note_signing_turn()).unwrap();
+
+        let _started = thread.next_event().unwrap();
+        let approval = thread.next_event().unwrap();
+
+        let MedicalEventMsg::ApprovalRequested(approval) = approval.msg else {
+            panic!("expected approval request event");
+        };
+        assert_eq!(approval.class, MedicalApprovalClass::SignedClinicalChange);
+        assert_eq!(thread.status(), MedicalAgentStatus::WaitingForApproval);
 
         thread.shutdown_and_wait().unwrap();
     }

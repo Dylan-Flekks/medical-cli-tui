@@ -27,6 +27,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         " encounter  ".into(),
         " r ".black().on_cyan(),
         " refresh  ".into(),
+        " F5 ".black().on_cyan(),
+        " agent  ".into(),
+        " F6 ".black().on_yellow(),
+        " approve  ".into(),
+        " F7 ".black().on_yellow(),
+        " deny  ".into(),
+        " F8 ".black().on_yellow(),
+        " cancel  ".into(),
     ];
 
     if app.selected_tab == WorkspaceTab::Note {
@@ -63,6 +71,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     spans.extend([
         format!(" focus: {} ", app.focus.title())
+            .black()
+            .on_dark_gray(),
+        format!(" agent: {} ", app.agent.status_label())
             .black()
             .on_dark_gray(),
         " PHI local-only ".black().on_green(),

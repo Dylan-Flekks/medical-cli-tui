@@ -170,14 +170,25 @@ fn short_id(id: impl std::fmt::Display) -> String {
 }
 
 fn render_audit(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let items = app
+    let mut rendered = app
         .data
         .audit_flags
         .iter()
-        .map(|flag| ListItem::new(flag.message.clone()).style(theme::severity(flag.severity)));
+        .map(|flag| ListItem::new(flag.message.clone()).style(theme::severity(flag.severity)))
+        .collect::<Vec<_>>();
+
+    if !app.agent.events.is_empty() {
+        rendered.push(
+            ListItem::new("Agent events").style(Style::default().add_modifier(Modifier::BOLD)),
+        );
+        rendered.extend(app.agent.events.iter().rev().map(|event| {
+            ListItem::new(format!("agent: {}", event.message))
+                .style(theme::severity(event.severity))
+        }));
+    }
 
     frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title("Audit Flags")),
+        List::new(rendered).block(Block::default().borders(Borders::ALL).title("Audit Flags")),
         area,
     );
 }

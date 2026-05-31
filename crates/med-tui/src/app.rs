@@ -1,8 +1,13 @@
 use anyhow::{anyhow, Result};
+use std::time::Duration;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use med_agent::{
-    MedicalApprovalPolicy, MedicalToolContext, MedicalToolInvocation, MedicalToolPayload,
-    MedicalToolRuntimeRegistry, SaveNoteDraftRequest, SignNoteRequest,
+    MedicalAgentStatus, MedicalAgentThread, MedicalApprovalClass, MedicalApprovalPolicy,
+    MedicalApprovalResponse, MedicalEvent, MedicalEventMsg, MedicalLoopLimits, MedicalOp,
+    MedicalReviewDecision, MedicalToolContext, MedicalToolInvocation, MedicalToolName,
+    MedicalToolPayload, MedicalToolRuntimeRegistry, MedicalTurnAbortReason, MedicalTurnRequest,
+    SaveNoteDraftRequest, SignNoteRequest,
 };
 use med_core::{
     new_id, ClinicalNote, Encounter, EncounterId, EncounterStatus, EncounterType, NoteId,
@@ -15,6 +20,8 @@ use tui_textarea::{CursorMove, Input, Key, TextArea};
 const SIGNING_ARMED_MESSAGE: &str = "Press S again to sign this note; any other key cancels";
 const SIGNED_NOTE_LOCKED_MESSAGE: &str =
     "Signed note is immutable; future edits require an amendment flow";
+const AGENT_EVENT_LIMIT: usize = 8;
+const LOCAL_AGENT_USER: &str = "local-tui-user";
 
 #[derive(Debug, Clone)]
 pub struct App {
@@ -30,6 +37,7 @@ pub struct App {
     pub note_signed_at: Option<String>,
     pub note_signing_armed: bool,
     pub note_dirty: bool,
+    pub agent: AgentPanelState,
     pub last_message: String,
     pub should_quit: bool,
 }
@@ -49,6 +57,7 @@ impl Default for App {
             note_signed_at: None,
             note_signing_armed: false,
             note_dirty: false,
+            agent: AgentPanelState::default(),
             last_message: "Local database not loaded".to_owned(),
             should_quit: false,
         }
@@ -77,7 +86,21 @@ impl App {
         self.refresh_from_store_with_selection(store, preferred_patient_id)
     }
 
+    #[cfg(test)]
     pub fn handle_key_with_store(&mut self, key: KeyEvent, store: &LocalStore) -> Result<()> {
+        self.handle_key_with_store_and_agent(key, store, None)
+    }
+
+    pub fn handle_key_with_store_and_agent(
+        &mut self,
+        key: KeyEvent,
+        store: &LocalStore,
+        agent_thread: Option<&MedicalAgentThread>,
+    ) -> Result<()> {
+        if self.handle_agent_key(key, agent_thread)? {
+            return Ok(());
+        }
+
         if self.selected_tab == WorkspaceTab::Note && is_note_sign_key(key) {
             if self.note_signing_armed {
                 self.sign_note(store)?;
@@ -164,6 +187,336 @@ impl App {
 
     pub fn note_is_signed(&self) -> bool {
         self.note_status.as_deref() == Some("Signed")
+    }
+
+    pub fn drain_agent_events(
+        &mut self,
+        agent_thread: &MedicalAgentThread,
+        first_wait: Duration,
+    ) -> Result<usize> {
+        self.sync_agent_thread_status(agent_thread.status());
+
+        let mut drained = 0;
+        if let Some(event) = agent_thread.next_event_timeout(first_wait)? {
+            self.apply_agent_event(event);
+            drained += 1;
+        }
+
+        while let Some(event) = agent_thread.next_event_timeout(Duration::ZERO)? {
+            self.apply_agent_event(event);
+            drained += 1;
+        }
+
+        self.sync_agent_thread_status(agent_thread.status());
+        Ok(drained)
+    }
+
+    fn handle_agent_key(
+        &mut self,
+        key: KeyEvent,
+        agent_thread: Option<&MedicalAgentThread>,
+    ) -> Result<bool> {
+        match key.code {
+            KeyCode::F(5) => {
+                self.start_agent_turn(agent_thread)?;
+                Ok(true)
+            }
+            KeyCode::F(6) => {
+                self.approve_pending_agent_action(agent_thread)?;
+                Ok(true)
+            }
+            KeyCode::F(7) => {
+                self.deny_pending_agent_action(agent_thread)?;
+                Ok(true)
+            }
+            KeyCode::F(8) => {
+                self.cancel_agent_turn(agent_thread)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn start_agent_turn(&mut self, agent_thread: Option<&MedicalAgentThread>) -> Result<()> {
+        let Some(agent_thread) = agent_thread else {
+            self.last_message = "Agent thread is not available in this context".to_owned();
+            return Ok(());
+        };
+        let Some(patient_id) = self.active_patient().map(|patient| patient.id) else {
+            self.last_message = "Select a patient before starting an agent turn".to_owned();
+            return Ok(());
+        };
+
+        let encounter_id = self.active_encounter().map(|encounter| encounter.id);
+        let note_id = self.note_draft_id;
+        let mut requested_tools = vec![
+            MedicalToolName::ReadPatientSummary,
+            MedicalToolName::RunDocumentationAudit,
+        ];
+        if self.selected_tab == WorkspaceTab::Note && note_id.is_some() && !self.note_is_signed() {
+            requested_tools.push(MedicalToolName::SignNote);
+        }
+
+        agent_thread.submit(MedicalOp::StartTurn(MedicalTurnRequest {
+            instruction: agent_turn_instruction(
+                note_id,
+                requested_tools.contains(&MedicalToolName::SignNote),
+            ),
+            patient_id: Some(patient_id),
+            encounter_id,
+            note_id,
+            contains_phi: true,
+            requested_tools,
+            provider: None,
+            loop_limits: MedicalLoopLimits::default(),
+        }))?;
+
+        self.agent.panel_status = AgentPanelStatus::Running;
+        self.agent.record_event(
+            "Submitted local bounded agent turn".to_owned(),
+            Severity::Info,
+        );
+        self.last_message = "Submitted local bounded agent turn".to_owned();
+
+        Ok(())
+    }
+
+    fn approve_pending_agent_action(
+        &mut self,
+        agent_thread: Option<&MedicalAgentThread>,
+    ) -> Result<()> {
+        let Some(agent_thread) = agent_thread else {
+            self.last_message = "Agent thread is not available in this context".to_owned();
+            return Ok(());
+        };
+        let Some(pending) = self.agent.pending_approval.clone() else {
+            self.last_message = "No pending agent approval to approve".to_owned();
+            return Ok(());
+        };
+
+        agent_thread.submit(MedicalOp::ApproveAction(MedicalApprovalResponse {
+            approval_id: pending.approval_id,
+            turn_id: pending.turn_id,
+            decided_by: LOCAL_AGENT_USER.to_owned(),
+            decision: MedicalReviewDecision::ApprovedForTurn,
+            redacted_reason: Some("Approved in local TUI".to_owned()),
+        }))?;
+        self.last_message = "Approved pending agent action".to_owned();
+
+        Ok(())
+    }
+
+    fn deny_pending_agent_action(
+        &mut self,
+        agent_thread: Option<&MedicalAgentThread>,
+    ) -> Result<()> {
+        let Some(agent_thread) = agent_thread else {
+            self.last_message = "Agent thread is not available in this context".to_owned();
+            return Ok(());
+        };
+        let Some(pending) = self.agent.pending_approval.clone() else {
+            self.last_message = "No pending agent approval to deny".to_owned();
+            return Ok(());
+        };
+
+        agent_thread.submit(MedicalOp::DenyAction(MedicalApprovalResponse {
+            approval_id: pending.approval_id,
+            turn_id: pending.turn_id,
+            decided_by: LOCAL_AGENT_USER.to_owned(),
+            decision: MedicalReviewDecision::Denied,
+            redacted_reason: Some("Denied in local TUI".to_owned()),
+        }))?;
+        self.last_message = "Denied pending agent action".to_owned();
+
+        Ok(())
+    }
+
+    fn cancel_agent_turn(&mut self, agent_thread: Option<&MedicalAgentThread>) -> Result<()> {
+        let Some(agent_thread) = agent_thread else {
+            self.last_message = "Agent thread is not available in this context".to_owned();
+            return Ok(());
+        };
+        let turn_id = self.agent.active_turn_id.clone().or_else(|| {
+            self.agent
+                .pending_approval
+                .as_ref()
+                .map(|pending| pending.turn_id.clone())
+        });
+        let Some(turn_id) = turn_id else {
+            self.last_message = "No active agent turn to cancel".to_owned();
+            return Ok(());
+        };
+
+        agent_thread.submit(MedicalOp::CancelTurn {
+            turn_id,
+            reason: "Cancelled in local TUI".to_owned(),
+        })?;
+        self.agent.panel_status = AgentPanelStatus::Cancelling;
+        self.last_message = "Cancelling active agent turn".to_owned();
+
+        Ok(())
+    }
+
+    fn apply_agent_event(&mut self, event: MedicalEvent) {
+        match event.msg {
+            MedicalEventMsg::SessionConfigured(configured) => {
+                self.agent.thread_status = MedicalAgentStatus::Idle;
+                self.agent.loop_limits = configured.default_loop_limits;
+                self.agent.record_event(
+                    format!(
+                        "Agent session configured: local-only, {} step limit",
+                        configured.default_loop_limits.max_steps
+                    ),
+                    Severity::Info,
+                );
+            }
+            MedicalEventMsg::TurnStarted(started) => {
+                self.agent.panel_status = AgentPanelStatus::Running;
+                self.agent.active_turn_id = Some(started.turn_id.clone());
+                self.agent.patient_id = started.patient_id;
+                self.agent.encounter_id = started.encounter_id;
+                self.agent.note_id = started.note_id;
+                self.agent.contains_phi = started.contains_phi;
+                self.agent.loop_limits = started.loop_limits;
+                self.agent.pending_approval = None;
+                self.agent.last_error = None;
+                self.agent.record_event(
+                    format!("Turn {} started", short_text(&started.turn_id)),
+                    Severity::Info,
+                );
+                self.last_message = "Agent turn started".to_owned();
+            }
+            MedicalEventMsg::TurnStepStarted(step) => {
+                self.agent.record_event(
+                    format!("Step {}: {}", step.step_index, step.redacted_summary),
+                    Severity::Info,
+                );
+            }
+            MedicalEventMsg::ToolStarted(tool) => {
+                self.agent.record_event(
+                    format!(
+                        "Tool {} started: {}",
+                        tool.tool_name.as_str(),
+                        tool.redacted_summary
+                    ),
+                    Severity::Info,
+                );
+            }
+            MedicalEventMsg::ToolFinished(tool) => {
+                self.agent.record_event(
+                    format!(
+                        "Tool {} finished: {}",
+                        tool.tool_name.as_str(),
+                        tool.redacted_summary
+                    ),
+                    Severity::Info,
+                );
+            }
+            MedicalEventMsg::ApprovalRequested(approval) => {
+                self.agent.panel_status = AgentPanelStatus::WaitingForApproval;
+                self.agent.active_turn_id = Some(approval.turn_id.clone());
+                self.agent.pending_approval = Some(AgentPendingApproval {
+                    approval_id: approval.approval_id.clone(),
+                    turn_id: approval.turn_id,
+                    class: approval.class,
+                    redacted_reason: approval.redacted_reason.clone(),
+                });
+                self.agent.record_event(
+                    format!(
+                        "Approval requested: {}",
+                        approval_class_label(approval.class)
+                    ),
+                    Severity::Warning,
+                );
+                self.last_message = format!(
+                    "Agent waiting for {} approval",
+                    approval_class_label(approval.class)
+                );
+            }
+            MedicalEventMsg::ApprovalResolved(resolved) => {
+                self.agent.pending_approval = None;
+                self.agent.panel_status = AgentPanelStatus::Running;
+                self.agent.record_event(
+                    format!("Approval {}", review_decision_label(resolved.decision)),
+                    Severity::Info,
+                );
+                self.last_message = "Agent approval resolved".to_owned();
+            }
+            MedicalEventMsg::TurnComplete(complete) => {
+                self.agent.panel_status = AgentPanelStatus::Complete;
+                self.agent.active_turn_id = None;
+                self.agent.pending_approval = None;
+                self.agent.record_event(
+                    format!(
+                        "Turn {} complete: {}",
+                        short_text(&complete.turn_id),
+                        complete.redacted_summary
+                    ),
+                    Severity::Info,
+                );
+                self.last_message = "Agent turn complete".to_owned();
+            }
+            MedicalEventMsg::TurnAborted(aborted) => {
+                self.agent.panel_status = if aborted.reason == MedicalTurnAbortReason::UserCancelled
+                {
+                    AgentPanelStatus::Cancelled
+                } else {
+                    AgentPanelStatus::Aborted
+                };
+                self.agent.active_turn_id = None;
+                self.agent.pending_approval = None;
+                self.agent.last_error = Some(aborted.redacted_summary.clone());
+                self.agent.record_event(
+                    format!(
+                        "Turn {} {}: {}",
+                        short_text(&aborted.turn_id),
+                        abort_reason_label(aborted.reason),
+                        aborted.redacted_summary
+                    ),
+                    Severity::Warning,
+                );
+                self.last_message = "Agent turn stopped".to_owned();
+            }
+            MedicalEventMsg::PolicyBlocked(blocked) => {
+                self.agent.panel_status = AgentPanelStatus::PolicyBlocked;
+                self.agent.active_turn_id = blocked.turn_id;
+                self.agent.pending_approval = None;
+                self.agent.last_error = Some(blocked.redacted_summary.clone());
+                self.agent
+                    .record_event(blocked.redacted_summary.clone(), Severity::Blocked);
+                self.last_message = "Agent policy block recorded".to_owned();
+            }
+            MedicalEventMsg::Error(error) => {
+                self.agent.panel_status = AgentPanelStatus::Error;
+                self.agent.last_error = Some(error.redacted_message.clone());
+                self.agent
+                    .record_event(error.redacted_message.clone(), Severity::Error);
+                self.last_message = "Agent error recorded".to_owned();
+            }
+            MedicalEventMsg::ShutdownComplete => {
+                self.agent.panel_status = AgentPanelStatus::Stopped;
+                self.agent.active_turn_id = None;
+                self.agent.pending_approval = None;
+                self.agent
+                    .record_event("Agent session stopped".to_owned(), Severity::Info);
+            }
+        }
+    }
+
+    fn sync_agent_thread_status(&mut self, status: MedicalAgentStatus) {
+        self.agent.thread_status = status;
+        if matches!(self.agent.panel_status, AgentPanelStatus::Idle)
+            || matches!(
+                status,
+                MedicalAgentStatus::Running
+                    | MedicalAgentStatus::WaitingForApproval
+                    | MedicalAgentStatus::Cancelling
+                    | MedicalAgentStatus::ShuttingDown
+                    | MedicalAgentStatus::Stopped
+            )
+        {
+            self.agent.panel_status = AgentPanelStatus::from_thread_status(status);
+        }
     }
 
     fn refresh_from_store_with_selection(
@@ -509,6 +862,115 @@ impl WorkspaceTab {
 }
 
 #[derive(Debug, Clone)]
+pub struct AgentPanelState {
+    pub panel_status: AgentPanelStatus,
+    pub thread_status: MedicalAgentStatus,
+    pub active_turn_id: Option<String>,
+    pub patient_id: Option<PatientId>,
+    pub encounter_id: Option<EncounterId>,
+    pub note_id: Option<NoteId>,
+    pub contains_phi: bool,
+    pub loop_limits: MedicalLoopLimits,
+    pub pending_approval: Option<AgentPendingApproval>,
+    pub events: Vec<AgentEventItem>,
+    pub last_error: Option<String>,
+}
+
+impl Default for AgentPanelState {
+    fn default() -> Self {
+        Self {
+            panel_status: AgentPanelStatus::Idle,
+            thread_status: MedicalAgentStatus::Idle,
+            active_turn_id: None,
+            patient_id: None,
+            encounter_id: None,
+            note_id: None,
+            contains_phi: false,
+            loop_limits: MedicalLoopLimits::default(),
+            pending_approval: None,
+            events: Vec::new(),
+            last_error: None,
+        }
+    }
+}
+
+impl AgentPanelState {
+    pub fn status_label(&self) -> &'static str {
+        self.panel_status.label()
+    }
+
+    pub fn thread_status_label(&self) -> &'static str {
+        medical_agent_status_label(self.thread_status)
+    }
+
+    fn record_event(&mut self, message: String, severity: Severity) {
+        self.events.push(AgentEventItem { message, severity });
+        if self.events.len() > AGENT_EVENT_LIMIT {
+            let overflow = self.events.len() - AGENT_EVENT_LIMIT;
+            self.events.drain(0..overflow);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentPanelStatus {
+    Idle,
+    Running,
+    WaitingForApproval,
+    Cancelling,
+    Cancelled,
+    Complete,
+    Aborted,
+    PolicyBlocked,
+    Error,
+    ShuttingDown,
+    Stopped,
+}
+
+impl AgentPanelStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::WaitingForApproval => "waiting",
+            Self::Cancelling => "cancelling",
+            Self::Cancelled => "cancelled",
+            Self::Complete => "complete",
+            Self::Aborted => "aborted",
+            Self::PolicyBlocked => "blocked",
+            Self::Error => "error",
+            Self::ShuttingDown => "shutdown",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    fn from_thread_status(status: MedicalAgentStatus) -> Self {
+        match status {
+            MedicalAgentStatus::Idle => Self::Idle,
+            MedicalAgentStatus::Running => Self::Running,
+            MedicalAgentStatus::WaitingForApproval => Self::WaitingForApproval,
+            MedicalAgentStatus::Cancelling => Self::Cancelling,
+            MedicalAgentStatus::ShuttingDown => Self::ShuttingDown,
+            MedicalAgentStatus::Stopped => Self::Stopped,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentPendingApproval {
+    pub approval_id: String,
+    pub turn_id: String,
+    pub class: MedicalApprovalClass,
+    pub redacted_reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentEventItem {
+    pub message: String,
+    pub severity: Severity,
+}
+
+#[derive(Debug, Clone)]
 pub struct DashboardData {
     pub patients: Vec<PatientQueueItem>,
     pub encounters: Vec<EncounterItem>,
@@ -820,6 +1282,67 @@ fn short_id(id: impl std::fmt::Display) -> String {
     id.to_string()[..8].to_owned()
 }
 
+fn short_text(value: &str) -> String {
+    value.chars().take(8).collect()
+}
+
+fn agent_turn_instruction(note_id: Option<NoteId>, requests_signing: bool) -> String {
+    if requests_signing {
+        return "Review the selected local SOAP note for signed clinical change readiness"
+            .to_owned();
+    }
+
+    if note_id.is_some() {
+        "Review the selected local SOAP note and documentation audit state".to_owned()
+    } else {
+        "Review the selected local chart and documentation audit state".to_owned()
+    }
+}
+
+fn approval_class_label(class: MedicalApprovalClass) -> &'static str {
+    match class {
+        MedicalApprovalClass::OutboundPhi => "outbound PHI",
+        MedicalApprovalClass::SignedClinicalChange => "signed clinical change",
+        MedicalApprovalClass::BillingSupportExport => "billing support export",
+        MedicalApprovalClass::DestructiveLocalWrite => "destructive local write",
+        MedicalApprovalClass::DesktopAutomation => "desktop automation",
+        MedicalApprovalClass::BulkImport => "bulk import",
+        MedicalApprovalClass::BulkExport => "bulk export",
+        MedicalApprovalClass::PluginInstall => "plugin install",
+    }
+}
+
+fn review_decision_label(decision: MedicalReviewDecision) -> &'static str {
+    match decision {
+        MedicalReviewDecision::Approved => "approved",
+        MedicalReviewDecision::ApprovedForTurn => "approved for turn",
+        MedicalReviewDecision::Denied => "denied",
+        MedicalReviewDecision::AbortTurn => "aborted",
+    }
+}
+
+fn abort_reason_label(reason: MedicalTurnAbortReason) -> &'static str {
+    match reason {
+        MedicalTurnAbortReason::UserCancelled => "cancelled",
+        MedicalTurnAbortReason::ReplacedByNewTurn => "replaced",
+        MedicalTurnAbortReason::PolicyBlocked => "blocked",
+        MedicalTurnAbortReason::LoopLimitExceeded => "exceeded loop limit",
+        MedicalTurnAbortReason::RuntimeError => "failed",
+        MedicalTurnAbortReason::Shutdown => "stopped",
+    }
+}
+
+fn medical_agent_status_label(status: MedicalAgentStatus) -> &'static str {
+    match status {
+        MedicalAgentStatus::Idle => "idle",
+        MedicalAgentStatus::Running => "running",
+        MedicalAgentStatus::WaitingForApproval => "waiting",
+        MedicalAgentStatus::Cancelling => "cancelling",
+        MedicalAgentStatus::ShuttingDown => "shutdown",
+        MedicalAgentStatus::Stopped => "stopped",
+    }
+}
+
 fn patient_status(encounters: &[Encounter]) -> String {
     if encounters.is_empty() {
         return "no encounters".to_owned();
@@ -1061,6 +1584,7 @@ mod tests {
     use crossterm::event::{KeyEvent, KeyModifiers};
     use med_store::LocalStore;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1078,6 +1602,22 @@ mod tests {
 
     fn cleanup(path: PathBuf) {
         let _ = std::fs::remove_file(path);
+    }
+
+    fn drain_agent_until(
+        app: &mut App,
+        agent_thread: &med_agent::MedicalAgentThread,
+        mut done: impl FnMut(&App) -> bool,
+    ) {
+        for _ in 0..8 {
+            app.drain_agent_events(agent_thread, Duration::from_millis(100))
+                .unwrap();
+            if done(app) {
+                return;
+            }
+        }
+
+        panic!("agent events did not reach expected state");
     }
 
     fn insert_patient_with_encounter(
@@ -1186,6 +1726,23 @@ mod tests {
 
         assert_eq!(app.note_editor.lines()[1], "x");
         assert!(app.note_dirty);
+    }
+
+    #[test]
+    fn agent_start_key_without_thread_reports_unavailable() {
+        let (store, path) = temp_store();
+        let mut app = App::from_store(&store).unwrap();
+
+        app.handle_key_with_store(key(KeyCode::F(5)), &store)
+            .unwrap();
+
+        assert_eq!(
+            app.last_message,
+            "Agent thread is not available in this context"
+        );
+
+        drop(store);
+        cleanup(path);
     }
 
     #[test]
@@ -1399,6 +1956,134 @@ mod tests {
         assert!(app.note_signing_armed);
         assert_eq!(app.last_message, SIGNING_ARMED_MESSAGE);
 
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn agent_note_turn_waits_for_signed_change_approval_then_completes() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) =
+            insert_patient_with_encounter(&store, "Synthetic Agent Patient");
+        let note_id = upsert_test_note(
+            &store,
+            patient_id,
+            encounter_id,
+            "Ready for agent review",
+            OffsetDateTime::now_utc(),
+            1,
+        );
+        let mut app = App::from_store(&store).unwrap();
+        app.selected_tab = WorkspaceTab::Note;
+        app.focus = FocusArea::Workspace;
+        let agent_thread =
+            med_agent::MedicalAgentThread::spawn(med_agent::MedicalAgentThreadConfig::default());
+
+        drain_agent_until(&mut app, &agent_thread, |app| !app.agent.events.is_empty());
+        app.handle_key_with_store_and_agent(key(KeyCode::F(5)), &store, Some(&agent_thread))
+            .unwrap();
+        drain_agent_until(&mut app, &agent_thread, |app| {
+            app.agent.pending_approval.is_some()
+        });
+
+        let pending = app.agent.pending_approval.as_ref().unwrap();
+        assert_eq!(app.agent.panel_status, AgentPanelStatus::WaitingForApproval);
+        assert_eq!(pending.class, MedicalApprovalClass::SignedClinicalChange);
+        assert_eq!(app.agent.note_id, Some(note_id));
+
+        app.handle_key_with_store_and_agent(key(KeyCode::F(6)), &store, Some(&agent_thread))
+            .unwrap();
+        drain_agent_until(&mut app, &agent_thread, |app| {
+            app.agent.panel_status == AgentPanelStatus::Complete
+        });
+
+        assert!(app.agent.pending_approval.is_none());
+        assert!(app
+            .agent
+            .events
+            .iter()
+            .any(|event| event.message.contains("approved for turn")));
+
+        agent_thread.shutdown_and_wait().unwrap();
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn agent_pending_approval_can_be_denied_from_tui() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) =
+            insert_patient_with_encounter(&store, "Synthetic Agent Deny Patient");
+        upsert_test_note(
+            &store,
+            patient_id,
+            encounter_id,
+            "Ready for denial",
+            OffsetDateTime::now_utc(),
+            1,
+        );
+        let mut app = App::from_store(&store).unwrap();
+        app.selected_tab = WorkspaceTab::Note;
+        let agent_thread =
+            med_agent::MedicalAgentThread::spawn(med_agent::MedicalAgentThreadConfig::default());
+
+        drain_agent_until(&mut app, &agent_thread, |app| !app.agent.events.is_empty());
+        app.handle_key_with_store_and_agent(key(KeyCode::F(5)), &store, Some(&agent_thread))
+            .unwrap();
+        drain_agent_until(&mut app, &agent_thread, |app| {
+            app.agent.pending_approval.is_some()
+        });
+        app.handle_key_with_store_and_agent(key(KeyCode::F(7)), &store, Some(&agent_thread))
+            .unwrap();
+        drain_agent_until(&mut app, &agent_thread, |app| {
+            app.agent.panel_status == AgentPanelStatus::Aborted
+        });
+
+        assert!(app.agent.pending_approval.is_none());
+        assert!(app
+            .agent
+            .events
+            .iter()
+            .any(|event| event.message.contains("denied")));
+
+        agent_thread.shutdown_and_wait().unwrap();
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn agent_pending_turn_can_be_cancelled_from_tui() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) =
+            insert_patient_with_encounter(&store, "Synthetic Agent Cancel Patient");
+        upsert_test_note(
+            &store,
+            patient_id,
+            encounter_id,
+            "Ready for cancellation",
+            OffsetDateTime::now_utc(),
+            1,
+        );
+        let mut app = App::from_store(&store).unwrap();
+        app.selected_tab = WorkspaceTab::Note;
+        let agent_thread =
+            med_agent::MedicalAgentThread::spawn(med_agent::MedicalAgentThreadConfig::default());
+
+        drain_agent_until(&mut app, &agent_thread, |app| !app.agent.events.is_empty());
+        app.handle_key_with_store_and_agent(key(KeyCode::F(5)), &store, Some(&agent_thread))
+            .unwrap();
+        drain_agent_until(&mut app, &agent_thread, |app| {
+            app.agent.pending_approval.is_some()
+        });
+        app.handle_key_with_store_and_agent(key(KeyCode::F(8)), &store, Some(&agent_thread))
+            .unwrap();
+        drain_agent_until(&mut app, &agent_thread, |app| {
+            app.agent.panel_status == AgentPanelStatus::Cancelled
+        });
+
+        assert!(app.agent.pending_approval.is_none());
+
+        agent_thread.shutdown_and_wait().unwrap();
         drop(store);
         cleanup(path);
     }
