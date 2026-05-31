@@ -10,7 +10,8 @@ use med_agent::{
     SaveNoteDraftRequest, SignNoteRequest,
 };
 use med_core::{
-    new_id, ClinicalNote, Encounter, EncounterId, EncounterStatus, EncounterType, NoteId,
+    audit_documentation, new_id, ClinicalNote, DocumentationAuditFlag, DocumentationAuditReport,
+    DocumentationAuditSeverity, Encounter, EncounterId, EncounterStatus, EncounterType, NoteId,
     NoteSection, NoteStatus, NoteTemplate, Patient, PatientId,
 };
 use med_store::LocalStore;
@@ -536,6 +537,7 @@ impl App {
             selected_patient_index(&records, preferred_patient_id, self.selected_patient);
         self.data = DashboardData::from_local_records(&records, self.selected_patient);
         self.load_latest_note_draft(store)?;
+        self.refresh_documentation_audit(store)?;
 
         Ok(())
     }
@@ -631,6 +633,7 @@ impl App {
             .get_note(note_id)?
             .ok_or_else(|| anyhow!("saved note draft {note_id} was not found"))?;
         self.apply_note_metadata(&note);
+        self.refresh_documentation_audit(store)?;
         self.last_message = output.tui_summary;
 
         Ok(())
@@ -678,6 +681,52 @@ impl App {
         self.note_signed_at = None;
         self.note_signing_armed = false;
         self.note_dirty = false;
+    }
+
+    fn refresh_documentation_audit(&mut self, store: &LocalStore) -> Result<()> {
+        let Some(patient_id) = self.active_patient().map(|patient| patient.id) else {
+            self.data.audit_flags = vec![AuditFlagItem::info("No local chart selected")];
+            self.data.billing_ready_percent = 0;
+            return Ok(());
+        };
+
+        let encounter_id = self.active_encounter().map(|encounter| encounter.id);
+        let encounter = encounter_id
+            .map(|encounter_id| {
+                store
+                    .list_encounters_for_patient(patient_id)?
+                    .into_iter()
+                    .find(|encounter| encounter.id == encounter_id)
+                    .ok_or_else(|| anyhow!("active encounter {encounter_id} was not found"))
+            })
+            .transpose()?;
+        let note = self
+            .note_draft_id
+            .map(|note_id| store.get_note(note_id))
+            .transpose()?
+            .flatten();
+        let report = audit_documentation(
+            patient_id,
+            encounter.as_ref(),
+            note.as_ref(),
+            OffsetDateTime::now_utc(),
+        );
+
+        self.apply_documentation_audit_report(&report);
+        Ok(())
+    }
+
+    fn apply_documentation_audit_report(&mut self, report: &DocumentationAuditReport) {
+        self.data.audit_flags = if report.flags.is_empty() {
+            vec![AuditFlagItem::info("No documentation audit flags")]
+        } else {
+            report
+                .flags
+                .iter()
+                .map(AuditFlagItem::from_documentation_flag)
+                .collect()
+        };
+        self.data.billing_ready_percent = report.billing_ready_percent;
     }
 
     fn arm_note_signing(&mut self) {
@@ -738,6 +787,7 @@ impl App {
             .ok_or_else(|| anyhow!("signed note {note_id} was not found"))?;
 
         self.apply_note_metadata(&note);
+        self.refresh_documentation_audit(store)?;
         self.last_message = output.tui_summary;
 
         Ok(())
@@ -1205,6 +1255,17 @@ impl AuditFlagItem {
         Self {
             message: message.to_owned(),
             severity: Severity::Blocked,
+        }
+    }
+
+    fn from_documentation_flag(flag: &DocumentationAuditFlag) -> Self {
+        Self {
+            message: flag.message.clone(),
+            severity: match flag.severity {
+                DocumentationAuditSeverity::Info => Severity::Info,
+                DocumentationAuditSeverity::Warning => Severity::Warning,
+                DocumentationAuditSeverity::Error => Severity::Error,
+            },
         }
     }
 }
@@ -1804,6 +1865,12 @@ mod tests {
         assert_eq!(encounters.len(), 1);
         assert_eq!(app.data.encounters.len(), 1);
         assert_eq!(app.data.encounters[0].short_id, short_id(encounters[0].id));
+        assert_eq!(app.data.billing_ready_percent, 0);
+        assert!(app
+            .data
+            .audit_flags
+            .iter()
+            .any(|flag| flag.message == "No clinical note exists for the active encounter"));
 
         drop(store);
         cleanup(path);
@@ -2226,6 +2293,52 @@ mod tests {
         assert_eq!(note.sections[0].body, "Synthetic subjective text");
         assert!(!app.note_dirty);
         assert_eq!(store.audit_event_count().unwrap(), before + 1);
+        assert_eq!(app.data.billing_ready_percent, 50);
+        assert!(app
+            .data
+            .audit_flags
+            .iter()
+            .any(|flag| flag.message == "Clinical note is still unsigned"));
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn signing_complete_soap_note_marks_billing_ready() {
+        let (store, path) = temp_store();
+        let mut app = App::from_store(&store).unwrap();
+
+        app.handle_key_with_store(key(KeyCode::Char('n')), &store)
+            .unwrap();
+        app.handle_key_with_store(key(KeyCode::Char('e')), &store)
+            .unwrap();
+        app.selected_tab = WorkspaceTab::Note;
+        app.focus = FocusArea::Workspace;
+        app.note_editor = TextArea::from([
+            "Subjective:",
+            "Patient reports improvement",
+            "Objective:",
+            "Vitals stable",
+            "Assessment:",
+            "Improving",
+            "Plan:",
+            "Continue current plan",
+        ]);
+        app.note_dirty = true;
+
+        app.handle_key_with_store(ctrl_key(KeyCode::Char('s')), &store)
+            .unwrap();
+        app.handle_key_with_store(key(KeyCode::Char('S')), &store)
+            .unwrap();
+        app.handle_key_with_store(key(KeyCode::Char('S')), &store)
+            .unwrap();
+
+        assert_eq!(app.note_status.as_deref(), Some("Signed"));
+        assert_eq!(app.data.billing_ready_percent, 100);
+        assert!(app.data.audit_flags.iter().any(|flag| {
+            flag.message == "Signed note is immutable and ready for billing review"
+        }));
 
         drop(store);
         cleanup(path);
