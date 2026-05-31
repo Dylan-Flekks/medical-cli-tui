@@ -3,7 +3,10 @@ pub mod billing;
 pub mod clinical;
 pub mod ids;
 
-pub use audit::{AuditAction, AuditEvent};
+pub use audit::{
+    audit_documentation, AuditAction, AuditEvent, DocumentationAuditFlag, DocumentationAuditReport,
+    DocumentationAuditSeverity,
+};
 pub use billing::{BillingAuditFlag, ClaimDraft, DiagnosisCode, ProcedureCode};
 pub use clinical::{
     Allergy, ClinicalNote, Encounter, EncounterStatus, EncounterType, Medication, NoteSection,

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use med_core::{
-    new_id, AuditAction, AuditEvent, ClinicalNote, EncounterStatus, NoteId, NoteSection,
-    NoteStatus, NoteTemplate, PatientId, PractitionerId,
+    audit_documentation, new_id, AuditAction, AuditEvent, ClinicalNote, Encounter, EncounterStatus,
+    NoteId, NoteSection, NoteStatus, NoteTemplate, PatientId, PractitionerId,
 };
 use med_store::LocalStore;
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,7 @@ impl MedicalToolRuntimeRegistry {
         registry.register(SaveNoteDraftTool::new(MedicalToolName::CreateNoteDraft));
         registry.register(SaveNoteDraftTool::new(MedicalToolName::UpdateNoteDraft));
         registry.register(SignNoteTool);
+        registry.register(RunDocumentationAuditTool);
         registry
     }
 
@@ -101,6 +102,7 @@ pub enum MedicalToolPayload {
     ReadPatientSummary(ReadPatientSummaryRequest),
     SaveNoteDraft(SaveNoteDraftRequest),
     SignNote(SignNoteRequest),
+    RunDocumentationAudit(RunDocumentationAuditRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +124,13 @@ pub struct SignNoteRequest {
     pub note_id: NoteId,
     pub patient_id: PatientId,
     pub encounter_id: med_core::EncounterId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunDocumentationAuditRequest {
+    pub patient_id: PatientId,
+    pub encounter_id: Option<med_core::EncounterId>,
+    pub note_id: Option<NoteId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +266,9 @@ pub enum MedicalToolError {
 
     #[error("store error: {0}")]
     Store(#[from] med_store::StoreError),
+
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 struct ReadPatientSummaryTool;
@@ -531,6 +543,129 @@ impl MedicalToolRuntime for SignNoteTool {
     }
 }
 
+struct RunDocumentationAuditTool;
+
+impl MedicalToolRuntime for RunDocumentationAuditTool {
+    fn name(&self) -> MedicalToolName {
+        MedicalToolName::RunDocumentationAudit
+    }
+
+    fn risk_profile(&self) -> MedicalToolRisk {
+        MedicalToolRisk::LocalRead
+    }
+
+    fn handle(
+        &self,
+        invocation: MedicalToolInvocation<'_>,
+    ) -> Result<MedicalToolOutput, MedicalToolError> {
+        let MedicalToolPayload::RunDocumentationAudit(request) = invocation.payload else {
+            return Err(MedicalToolError::InvalidPayload {
+                tool: invocation.tool_name,
+                expected: "RunDocumentationAudit",
+            });
+        };
+
+        invocation
+            .store
+            .get_patient(request.patient_id)?
+            .ok_or(MedicalToolError::PatientNotFound(request.patient_id))?;
+
+        let encounter = load_requested_encounter(invocation.store, &request)?;
+        let note = load_requested_note(invocation.store, &request, encounter.as_ref())?;
+        let report = audit_documentation(
+            request.patient_id,
+            encounter.as_ref(),
+            note.as_ref(),
+            OffsetDateTime::now_utc(),
+        );
+        let audit_event_id = append_tool_audit(
+            invocation.store,
+            AuditAction::DocumentationAuditRan,
+            invocation.context.actor_id,
+            Some(report.patient_id),
+            report.encounter_id,
+            report.note_id,
+            json!({
+                "tool": invocation.tool_name.as_str(),
+                "call_id": invocation.call_id.clone(),
+                "flag_count": report.flags.len(),
+                "billing_ready_percent": report.billing_ready_percent
+            }),
+        )?;
+
+        Ok(MedicalToolOutput {
+            call_id: invocation.call_id,
+            tool_name: invocation.tool_name,
+            success: true,
+            model_summary: format!(
+                "Ran local documentation audit with {} flags and {}% billing readiness.",
+                report.flags.len(),
+                report.billing_ready_percent
+            ),
+            tui_summary: format!(
+                "Documentation audit: {} flags, {}% billing ready",
+                report.flags.len(),
+                report.billing_ready_percent
+            ),
+            structured: serde_json::to_value(&report)?,
+            audit_event_id: Some(audit_event_id),
+        })
+    }
+}
+
+fn load_requested_encounter(
+    store: &LocalStore,
+    request: &RunDocumentationAuditRequest,
+) -> Result<Option<Encounter>, MedicalToolError> {
+    let Some(encounter_id) = request.encounter_id else {
+        return Ok(None);
+    };
+
+    let encounter = store
+        .list_encounters_for_patient(request.patient_id)?
+        .into_iter()
+        .find(|encounter| encounter.id == encounter_id)
+        .ok_or(MedicalToolError::EncounterNotFound {
+            patient_id: request.patient_id,
+            encounter_id,
+        })?;
+
+    Ok(Some(encounter))
+}
+
+fn load_requested_note(
+    store: &LocalStore,
+    request: &RunDocumentationAuditRequest,
+    encounter: Option<&Encounter>,
+) -> Result<Option<ClinicalNote>, MedicalToolError> {
+    if let Some(note_id) = request.note_id {
+        let note = store
+            .get_note(note_id)?
+            .ok_or(MedicalToolError::NoteNotFound(note_id))?;
+        if note.patient_id != request.patient_id
+            || request
+                .encounter_id
+                .is_some_and(|encounter_id| note.encounter_id != encounter_id)
+        {
+            return Err(MedicalToolError::EncounterNotFound {
+                patient_id: request.patient_id,
+                encounter_id: note.encounter_id,
+            });
+        }
+
+        return Ok(Some(note));
+    }
+
+    let Some(encounter) = encounter else {
+        return Ok(None);
+    };
+
+    Ok(store
+        .list_notes_for_encounter(encounter.id)?
+        .into_iter()
+        .next())
+}
+
 fn append_tool_audit(
     store: &LocalStore,
     action: AuditAction,
@@ -746,6 +881,48 @@ mod tests {
                 MedicalToolName::UpdateNoteDraft
             ))
         ));
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn documentation_audit_tool_returns_flags_and_writes_audit_event() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) = insert_patient_and_encounter(&store);
+        let note_id = insert_note_draft(&store, patient_id, encounter_id);
+        let registry = MedicalToolRuntimeRegistry::default();
+
+        let before = store.audit_event_count().unwrap();
+        let output = registry
+            .dispatch(MedicalToolInvocation {
+                store: &store,
+                call_id: "call-documentation-audit".to_owned(),
+                tool_name: MedicalToolName::RunDocumentationAudit,
+                payload: MedicalToolPayload::RunDocumentationAudit(RunDocumentationAuditRequest {
+                    patient_id,
+                    encounter_id: Some(encounter_id),
+                    note_id: Some(note_id),
+                }),
+                context: MedicalToolContext::default(),
+                approval_policy: MedicalApprovalPolicy::local_default(),
+            })
+            .unwrap();
+        let report: med_core::DocumentationAuditReport =
+            serde_json::from_value(output.structured).unwrap();
+
+        assert!(output.success);
+        assert_eq!(report.billing_ready_percent, 25);
+        assert_eq!(report.note_id, Some(note_id));
+        assert!(report
+            .flags
+            .iter()
+            .any(|flag| flag.code == "unsigned_draft"));
+        assert!(report
+            .flags
+            .iter()
+            .any(|flag| flag.code == "missing_section_objective"));
+        assert_eq!(store.audit_event_count().unwrap(), before + 1);
 
         drop(store);
         cleanup(path);

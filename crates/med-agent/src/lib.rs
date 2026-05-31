@@ -42,7 +42,7 @@ pub use tools::{
     MedicalApprovalDecision, MedicalApprovalPolicy, MedicalToolContext, MedicalToolError,
     MedicalToolInvocation, MedicalToolOutput, MedicalToolPayload, MedicalToolRisk,
     MedicalToolRuntime, MedicalToolRuntimeRegistry, ReadPatientSummaryRequest,
-    SaveNoteDraftRequest, SignNoteRequest,
+    RunDocumentationAuditRequest, SaveNoteDraftRequest, SignNoteRequest,
 };
 pub use turn::{
     ActiveMedicalTurn, ActiveMedicalTurnError, MedicalActiveTurnStatus, MedicalPendingApproval,
