@@ -32,6 +32,15 @@ pub enum StoreError {
 
     #[error("invalid note version value: {0}")]
     InvalidNoteVersion(i64),
+
+    #[error("note not found: {0}")]
+    NoteNotFound(NoteId),
+
+    #[error("signed note is immutable: {0}")]
+    SignedNoteImmutable(NoteId),
+
+    #[error("note {note_id} cannot be signed because status is {status}")]
+    NoteNotSignable { note_id: NoteId, status: String },
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -196,6 +205,12 @@ impl LocalStore {
     }
 
     pub fn upsert_note(&self, note: &ClinicalNote) -> StoreResult<()> {
+        if let Some(existing_status) = self.note_status(note.id)? {
+            if matches!(existing_status, NoteStatus::Signed) {
+                return Err(StoreError::SignedNoteImmutable(note.id));
+            }
+        }
+
         self.connection.execute(
             "insert into notes (
                 id, patient_id, encounter_id, author_id, template, status, version, created_at, updated_at, signed_at
@@ -246,6 +261,38 @@ impl LocalStore {
         Ok(())
     }
 
+    pub fn sign_note_draft(
+        &self,
+        note_id: NoteId,
+        signed_at: OffsetDateTime,
+    ) -> StoreResult<ClinicalNote> {
+        let note = self
+            .get_note(note_id)?
+            .ok_or(StoreError::NoteNotFound(note_id))?;
+
+        if !matches!(note.status, NoteStatus::Draft) {
+            return Err(StoreError::NoteNotSignable {
+                note_id,
+                status: note_status_label(&note.status).to_owned(),
+            });
+        }
+
+        self.connection.execute(
+            "update notes
+             set status = ?1, updated_at = ?2, signed_at = ?3
+             where id = ?4",
+            params![
+                serde_json::to_string(&NoteStatus::Signed)?,
+                format_offset_date_time(signed_at)?,
+                format_offset_date_time(signed_at)?,
+                note_id.to_string(),
+            ],
+        )?;
+
+        self.get_note(note_id)?
+            .ok_or(StoreError::NoteNotFound(note_id))
+    }
+
     pub fn get_note(&self, id: NoteId) -> StoreResult<Option<ClinicalNote>> {
         let mut statement = self.connection.prepare(
             "select id, patient_id, encounter_id, author_id, template, status, version, created_at, updated_at, signed_at
@@ -288,6 +335,96 @@ impl LocalStore {
                 .transpose()?,
             version: u32::try_from(version).map_err(|_| StoreError::InvalidNoteVersion(version))?,
         }))
+    }
+
+    pub fn list_notes_for_encounter(
+        &self,
+        encounter_id: med_core::EncounterId,
+    ) -> StoreResult<Vec<ClinicalNote>> {
+        let mut statement = self.connection.prepare(
+            "select id, patient_id, encounter_id, author_id, template, status, version, created_at, updated_at, signed_at
+             from notes
+             where encounter_id = ?1
+             order by updated_at desc, created_at desc",
+        )?;
+        let mut rows = statement.query(params![encounter_id.to_string()])?;
+        let mut notes = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            notes.push(self.clinical_note_from_row(row)?);
+        }
+
+        Ok(notes)
+    }
+
+    pub fn latest_draft_note_for_encounter(
+        &self,
+        encounter_id: med_core::EncounterId,
+    ) -> StoreResult<Option<ClinicalNote>> {
+        let draft_status = serde_json::to_string(&NoteStatus::Draft)?;
+        let mut statement = self.connection.prepare(
+            "select id, patient_id, encounter_id, author_id, template, status, version, created_at, updated_at, signed_at
+             from notes
+             where encounter_id = ?1 and status = ?2
+             order by updated_at desc, created_at desc
+             limit 1",
+        )?;
+        let mut rows = statement.query(params![encounter_id.to_string(), draft_status])?;
+
+        if let Some(row) = rows.next()? {
+            return Ok(Some(self.clinical_note_from_row(row)?));
+        }
+
+        Ok(None)
+    }
+
+    fn clinical_note_from_row(&self, row: &rusqlite::Row<'_>) -> StoreResult<ClinicalNote> {
+        let note_id: String = row.get(0)?;
+        let patient_id: String = row.get(1)?;
+        let encounter_id: String = row.get(2)?;
+        let author_id: Option<String> = row.get(3)?;
+        let template: String = row.get(4)?;
+        let status: String = row.get(5)?;
+        let version: i64 = row.get(6)?;
+        let created_at: String = row.get(7)?;
+        let updated_at: String = row.get(8)?;
+        let signed_at: Option<String> = row.get(9)?;
+
+        let id = parse_uuid(&note_id)?;
+
+        Ok(ClinicalNote {
+            id,
+            patient_id: parse_uuid(&patient_id)?,
+            encounter_id: parse_uuid(&encounter_id)?,
+            author_id: author_id
+                .as_deref()
+                .map(parse_practitioner_id)
+                .transpose()?,
+            template: serde_json::from_str::<NoteTemplate>(&template)?,
+            status: serde_json::from_str::<NoteStatus>(&status)?,
+            sections: self.list_note_sections(id)?,
+            created_at: parse_offset_date_time(&created_at)?,
+            updated_at: parse_offset_date_time(&updated_at)?,
+            signed_at: signed_at
+                .as_deref()
+                .map(parse_offset_date_time)
+                .transpose()?,
+            version: u32::try_from(version).map_err(|_| StoreError::InvalidNoteVersion(version))?,
+        })
+    }
+
+    fn note_status(&self, note_id: NoteId) -> StoreResult<Option<NoteStatus>> {
+        let mut statement = self
+            .connection
+            .prepare("select status from notes where id = ?1")?;
+        let mut rows = statement.query(params![note_id.to_string()])?;
+
+        if let Some(row) = rows.next()? {
+            let status: String = row.get(0)?;
+            return Ok(Some(serde_json::from_str::<NoteStatus>(&status)?));
+        }
+
+        Ok(None)
     }
 
     fn list_note_sections(&self, note_id: NoteId) -> StoreResult<Vec<NoteSection>> {
@@ -387,6 +524,16 @@ fn parse_uuid(value: &str) -> StoreResult<Uuid> {
 
 fn parse_practitioner_id(value: &str) -> StoreResult<PractitionerId> {
     parse_uuid(value)
+}
+
+fn note_status_label(status: &NoteStatus) -> &'static str {
+    match status {
+        NoteStatus::Draft => "Draft",
+        NoteStatus::Reviewed => "Reviewed",
+        NoteStatus::Signed => "Signed",
+        NoteStatus::Amended => "Amended",
+        NoteStatus::Voided => "Voided",
+    }
 }
 
 fn format_offset_date_time(value: OffsetDateTime) -> StoreResult<String> {
@@ -567,5 +714,155 @@ mod tests {
             encounters[0].encounter_type,
             EncounterType::OfficeVisit
         ));
+    }
+
+    #[test]
+    fn lists_encounter_notes_and_selects_latest_draft() {
+        let store = open_test_store();
+        let now = OffsetDateTime::now_utc();
+        let patient = Patient {
+            id: new_id(),
+            medical_record_number: None,
+            display_name: "Note Query Patient".to_owned(),
+            date_of_birth: None,
+            sex_at_birth: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let encounter = Encounter {
+            id: new_id(),
+            patient_id: patient.id,
+            practitioner_id: None,
+            encounter_type: EncounterType::OfficeVisit,
+            status: EncounterStatus::InProgress,
+            started_at: now,
+            ended_at: None,
+            reason: Some("Synthetic note query".to_owned()),
+        };
+        let old_draft = ClinicalNote {
+            id: new_id(),
+            patient_id: patient.id,
+            encounter_id: encounter.id,
+            author_id: None,
+            template: NoteTemplate::Soap,
+            status: NoteStatus::Draft,
+            sections: vec![NoteSection {
+                heading: "Subjective".to_owned(),
+                body: "Old draft".to_owned(),
+                required: true,
+            }],
+            created_at: now,
+            updated_at: now,
+            signed_at: None,
+            version: 1,
+        };
+        let signed_note = ClinicalNote {
+            id: new_id(),
+            patient_id: patient.id,
+            encounter_id: encounter.id,
+            author_id: None,
+            template: NoteTemplate::Soap,
+            status: NoteStatus::Signed,
+            sections: vec![NoteSection {
+                heading: "Subjective".to_owned(),
+                body: "Signed note".to_owned(),
+                required: true,
+            }],
+            created_at: now + time::Duration::minutes(1),
+            updated_at: now + time::Duration::minutes(3),
+            signed_at: Some(now + time::Duration::minutes(3)),
+            version: 1,
+        };
+        let latest_draft = ClinicalNote {
+            id: new_id(),
+            patient_id: patient.id,
+            encounter_id: encounter.id,
+            author_id: None,
+            template: NoteTemplate::Soap,
+            status: NoteStatus::Draft,
+            sections: vec![NoteSection {
+                heading: "Subjective".to_owned(),
+                body: "Latest draft".to_owned(),
+                required: true,
+            }],
+            created_at: now + time::Duration::minutes(2),
+            updated_at: now + time::Duration::minutes(4),
+            signed_at: None,
+            version: 2,
+        };
+
+        store.insert_patient(&patient).unwrap();
+        store.insert_encounter(&encounter).unwrap();
+        store.upsert_note(&old_draft).unwrap();
+        store.upsert_note(&signed_note).unwrap();
+        store.upsert_note(&latest_draft).unwrap();
+
+        let notes = store.list_notes_for_encounter(encounter.id).unwrap();
+        let loaded_latest_draft = store
+            .latest_draft_note_for_encounter(encounter.id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(notes.len(), 3);
+        assert_eq!(notes[0].id, latest_draft.id);
+        assert_eq!(loaded_latest_draft.id, latest_draft.id);
+        assert_eq!(loaded_latest_draft.sections[0].body, "Latest draft");
+    }
+
+    #[test]
+    fn signs_draft_note_and_blocks_later_updates() {
+        let store = open_test_store();
+        let now = OffsetDateTime::now_utc();
+        let patient = Patient {
+            id: new_id(),
+            medical_record_number: None,
+            display_name: "Sign Test Patient".to_owned(),
+            date_of_birth: None,
+            sex_at_birth: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let encounter = Encounter {
+            id: new_id(),
+            patient_id: patient.id,
+            practitioner_id: None,
+            encounter_type: EncounterType::OfficeVisit,
+            status: EncounterStatus::InProgress,
+            started_at: now,
+            ended_at: None,
+            reason: Some("Synthetic signing".to_owned()),
+        };
+        let mut note = ClinicalNote {
+            id: new_id(),
+            patient_id: patient.id,
+            encounter_id: encounter.id,
+            author_id: None,
+            template: NoteTemplate::Soap,
+            status: NoteStatus::Draft,
+            sections: vec![NoteSection {
+                heading: "Subjective".to_owned(),
+                body: "Draft body".to_owned(),
+                required: true,
+            }],
+            created_at: now,
+            updated_at: now,
+            signed_at: None,
+            version: 1,
+        };
+
+        store.insert_patient(&patient).unwrap();
+        store.insert_encounter(&encounter).unwrap();
+        store.upsert_note(&note).unwrap();
+
+        let signed_at = now + time::Duration::minutes(2);
+        let signed = store.sign_note_draft(note.id, signed_at).unwrap();
+
+        assert!(matches!(signed.status, NoteStatus::Signed));
+        assert_eq!(signed.signed_at, Some(signed_at));
+
+        note.sections[0].body = "Changed after signing".to_owned();
+        let error = store.upsert_note(&note).unwrap_err();
+
+        assert!(matches!(error, StoreError::SignedNoteImmutable(id) if id == note.id));
     }
 }

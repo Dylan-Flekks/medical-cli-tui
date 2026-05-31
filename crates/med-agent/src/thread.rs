@@ -242,7 +242,9 @@ impl MedicalSessionLoop {
             MedicalOp::ApproveAction(response) | MedicalOp::DenyAction(response) => {
                 self.resolve_approval(submission.id, response);
             }
-            MedicalOp::SaveNoteDraft { .. } | MedicalOp::RunLocalAudit { .. } => {
+            MedicalOp::SaveNoteDraft { .. }
+            | MedicalOp::SignNote { .. }
+            | MedicalOp::RunLocalAudit { .. } => {
                 self.emit(
                     Some(submission.id),
                     MedicalEventMsg::Error(MedicalAgentErrorEvent {

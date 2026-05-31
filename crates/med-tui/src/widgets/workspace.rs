@@ -138,11 +138,22 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_note(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut editor = app.note_editor.clone();
-    let title = if app.note_dirty {
-        "Structured SOAP Draft *"
+    let mut title = if let Some(note_id) = app.note_draft_id {
+        let status = app.note_status.as_deref().unwrap_or("Draft");
+        let version = app
+            .note_version
+            .map(|version| format!(" v{version}"))
+            .unwrap_or_default();
+        format!(
+            "Structured SOAP Draft {} | {status}{version}",
+            short_id(note_id)
+        )
     } else {
-        "Structured SOAP Draft"
+        "Structured SOAP Draft".to_owned()
     };
+    if app.note_dirty && !app.note_is_signed() {
+        title.push_str(" *");
+    }
 
     editor.set_block(
         Block::default()
@@ -152,6 +163,10 @@ fn render_note(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 
     frame.render_widget(&editor, area);
+}
+
+fn short_id(id: impl std::fmt::Display) -> String {
+    id.to_string()[..8].to_owned()
 }
 
 fn render_audit(frame: &mut Frame<'_>, area: Rect, app: &App) {
