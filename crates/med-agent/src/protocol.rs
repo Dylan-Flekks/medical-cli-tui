@@ -35,6 +35,11 @@ pub enum MedicalOp {
         encounter_id: EncounterId,
         note_id: Option<NoteId>,
     },
+    SignNote {
+        patient_id: PatientId,
+        encounter_id: EncounterId,
+        note_id: NoteId,
+    },
     RunLocalAudit {
         patient_id: PatientId,
         encounter_id: Option<EncounterId>,

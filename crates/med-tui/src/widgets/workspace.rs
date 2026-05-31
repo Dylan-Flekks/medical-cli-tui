@@ -151,7 +151,7 @@ fn render_note(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         "Structured SOAP Draft".to_owned()
     };
-    if app.note_dirty {
+    if app.note_dirty && !app.note_is_signed() {
         title.push_str(" *");
     }
 

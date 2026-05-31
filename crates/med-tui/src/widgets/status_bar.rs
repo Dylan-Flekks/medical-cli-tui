@@ -30,12 +30,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ];
 
     if app.selected_tab == WorkspaceTab::Note {
-        spans.extend([
-            " ctrl+s ".black().on_cyan(),
-            " save  ".into(),
-            " S ".black().on_yellow(),
-            " sign blocked  ".into(),
-        ]);
+        if app.note_is_signed() {
+            spans.extend([" signed ".black().on_green(), " locked  ".into()]);
+        } else {
+            spans.extend([
+                " ctrl+s ".black().on_cyan(),
+                " save  ".into(),
+                " S ".black().on_yellow(),
+                if app.note_signing_armed {
+                    " confirm sign  ".into()
+                } else {
+                    " sign  ".into()
+                },
+            ]);
+        }
 
         if let Some(note_id) = app.note_draft_id {
             let status = app.note_status.as_deref().unwrap_or("Draft");
@@ -46,6 +54,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             spans.extend([format!(" note: {} {status}{version} ", short_id(note_id))
                 .black()
                 .on_dark_gray()]);
+        }
+
+        if let Some(signed_at) = &app.note_signed_at {
+            spans.extend([format!(" signed: {signed_at} ").black().on_dark_gray()]);
         }
     }
 

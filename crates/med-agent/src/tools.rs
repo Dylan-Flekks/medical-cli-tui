@@ -46,6 +46,7 @@ impl MedicalToolRuntimeRegistry {
         registry.register(ReadPatientSummaryTool);
         registry.register(SaveNoteDraftTool::new(MedicalToolName::CreateNoteDraft));
         registry.register(SaveNoteDraftTool::new(MedicalToolName::UpdateNoteDraft));
+        registry.register(SignNoteTool);
         registry
     }
 
@@ -99,6 +100,7 @@ pub struct MedicalToolContext {
 pub enum MedicalToolPayload {
     ReadPatientSummary(ReadPatientSummaryRequest),
     SaveNoteDraft(SaveNoteDraftRequest),
+    SignNote(SignNoteRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +115,13 @@ pub struct SaveNoteDraftRequest {
     pub encounter_id: med_core::EncounterId,
     pub template: NoteTemplate,
     pub sections: Vec<NoteSection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignNoteRequest {
+    pub note_id: NoteId,
+    pub patient_id: PatientId,
+    pub encounter_id: med_core::EncounterId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +152,7 @@ pub struct MedicalApprovalPolicy {
     pub allow_local_reads: bool,
     pub allow_local_draft_writes: bool,
     pub require_human_approval_for_draft_writes: bool,
+    pub allow_signed_clinical_changes: bool,
 }
 
 impl MedicalApprovalPolicy {
@@ -151,6 +161,14 @@ impl MedicalApprovalPolicy {
             allow_local_reads: true,
             allow_local_draft_writes: true,
             require_human_approval_for_draft_writes: false,
+            allow_signed_clinical_changes: false,
+        }
+    }
+
+    pub fn after_human_confirmation() -> Self {
+        Self {
+            allow_signed_clinical_changes: true,
+            ..Self::local_default()
         }
     }
 
@@ -159,6 +177,7 @@ impl MedicalApprovalPolicy {
             allow_local_reads: true,
             allow_local_draft_writes: false,
             require_human_approval_for_draft_writes: false,
+            allow_signed_clinical_changes: false,
         }
     }
 
@@ -175,6 +194,9 @@ impl MedicalApprovalPolicy {
                 MedicalApprovalDecision::RequiresHumanApproval
             }
             MedicalToolRisk::LocalDraftWrite => MedicalApprovalDecision::Allowed,
+            MedicalToolRisk::SignedClinicalChange if self.allow_signed_clinical_changes => {
+                MedicalApprovalDecision::Allowed
+            }
             MedicalToolRisk::OutboundPhi
             | MedicalToolRisk::SignedClinicalChange
             | MedicalToolRisk::BillingSupportExport
@@ -226,6 +248,12 @@ pub enum MedicalToolError {
 
     #[error("note draft must include at least one section")]
     EmptyNoteSections,
+
+    #[error("note not found: {0}")]
+    NoteNotFound(NoteId),
+
+    #[error("note {0} is not a draft and cannot be signed")]
+    NoteNotDraft(NoteId),
 
     #[error("store error: {0}")]
     Store(#[from] med_store::StoreError),
@@ -427,6 +455,82 @@ impl MedicalToolRuntime for SaveNoteDraftTool {
     }
 }
 
+struct SignNoteTool;
+
+impl MedicalToolRuntime for SignNoteTool {
+    fn name(&self) -> MedicalToolName {
+        MedicalToolName::SignNote
+    }
+
+    fn risk_profile(&self) -> MedicalToolRisk {
+        MedicalToolRisk::SignedClinicalChange
+    }
+
+    fn handle(
+        &self,
+        invocation: MedicalToolInvocation<'_>,
+    ) -> Result<MedicalToolOutput, MedicalToolError> {
+        let MedicalToolPayload::SignNote(request) = invocation.payload else {
+            return Err(MedicalToolError::InvalidPayload {
+                tool: invocation.tool_name,
+                expected: "SignNote",
+            });
+        };
+
+        let note = invocation
+            .store
+            .get_note(request.note_id)?
+            .ok_or(MedicalToolError::NoteNotFound(request.note_id))?;
+        if note.patient_id != request.patient_id || note.encounter_id != request.encounter_id {
+            return Err(MedicalToolError::EncounterNotFound {
+                patient_id: request.patient_id,
+                encounter_id: request.encounter_id,
+            });
+        }
+        if !matches!(note.status, NoteStatus::Draft) {
+            return Err(MedicalToolError::NoteNotDraft(request.note_id));
+        }
+
+        let signed_at = OffsetDateTime::now_utc();
+        let signed_note = invocation
+            .store
+            .sign_note_draft(request.note_id, signed_at)?;
+        let audit_event_id = append_tool_audit(
+            invocation.store,
+            AuditAction::NoteSigned,
+            invocation.context.actor_id,
+            Some(signed_note.patient_id),
+            Some(signed_note.encounter_id),
+            Some(signed_note.id),
+            json!({
+                "tool": invocation.tool_name.as_str(),
+                "call_id": invocation.call_id.clone(),
+                "version": signed_note.version,
+                "signed_at": signed_at.to_string()
+            }),
+        )?;
+
+        Ok(MedicalToolOutput {
+            call_id: invocation.call_id,
+            tool_name: invocation.tool_name,
+            success: true,
+            model_summary:
+                "Signed local note after human confirmation. Signed content is now immutable."
+                    .to_owned(),
+            tui_summary: format!("Signed note {}", short_id(signed_note.id)),
+            structured: json!({
+                "note_id": signed_note.id,
+                "patient_id": signed_note.patient_id,
+                "encounter_id": signed_note.encounter_id,
+                "status": "Signed",
+                "version": signed_note.version,
+                "signed_at": signed_at
+            }),
+            audit_event_id: Some(audit_event_id),
+        })
+    }
+}
+
 fn append_tool_audit(
     store: &LocalStore,
     action: AuditAction,
@@ -504,6 +608,36 @@ mod tests {
         store.insert_encounter(&encounter).unwrap();
 
         (patient.id, encounter.id)
+    }
+
+    fn insert_note_draft(
+        store: &LocalStore,
+        patient_id: PatientId,
+        encounter_id: med_core::EncounterId,
+    ) -> NoteId {
+        let now = OffsetDateTime::now_utc();
+        let note = ClinicalNote {
+            id: new_id(),
+            patient_id,
+            encounter_id,
+            author_id: None,
+            template: NoteTemplate::Soap,
+            status: NoteStatus::Draft,
+            sections: vec![NoteSection {
+                heading: "Subjective".to_owned(),
+                body: "Synthetic note draft".to_owned(),
+                required: true,
+            }],
+            created_at: now,
+            updated_at: now,
+            signed_at: None,
+            version: 1,
+        };
+        let note_id = note.id;
+
+        store.upsert_note(&note).unwrap();
+
+        note_id
     }
 
     #[test]
@@ -612,6 +746,71 @@ mod tests {
                 MedicalToolName::UpdateNoteDraft
             ))
         ));
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn default_policy_requires_human_approval_for_note_signing() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) = insert_patient_and_encounter(&store);
+        let note_id = insert_note_draft(&store, patient_id, encounter_id);
+        let registry = MedicalToolRuntimeRegistry::default();
+
+        let result = registry.dispatch(MedicalToolInvocation {
+            store: &store,
+            call_id: "call-sign-note-blocked".to_owned(),
+            tool_name: MedicalToolName::SignNote,
+            payload: MedicalToolPayload::SignNote(SignNoteRequest {
+                note_id,
+                patient_id,
+                encounter_id,
+            }),
+            context: MedicalToolContext::default(),
+            approval_policy: MedicalApprovalPolicy::local_default(),
+        });
+
+        assert!(matches!(
+            result,
+            Err(MedicalToolError::ApprovalRequired(
+                MedicalToolName::SignNote
+            ))
+        ));
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn sign_note_tool_marks_note_signed_and_writes_audit_event() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) = insert_patient_and_encounter(&store);
+        let note_id = insert_note_draft(&store, patient_id, encounter_id);
+        let registry = MedicalToolRuntimeRegistry::default();
+
+        let before = store.audit_event_count().unwrap();
+        let output = registry
+            .dispatch(MedicalToolInvocation {
+                store: &store,
+                call_id: "call-sign-note".to_owned(),
+                tool_name: MedicalToolName::SignNote,
+                payload: MedicalToolPayload::SignNote(SignNoteRequest {
+                    note_id,
+                    patient_id,
+                    encounter_id,
+                }),
+                context: MedicalToolContext::default(),
+                approval_policy: MedicalApprovalPolicy::after_human_confirmation(),
+            })
+            .unwrap();
+        let note = store.get_note(note_id).unwrap().unwrap();
+
+        assert!(output.success);
+        assert_eq!(output.structured["status"], "Signed");
+        assert!(matches!(note.status, NoteStatus::Signed));
+        assert!(note.signed_at.is_some());
+        assert_eq!(store.audit_event_count().unwrap(), before + 1);
 
         drop(store);
         cleanup(path);

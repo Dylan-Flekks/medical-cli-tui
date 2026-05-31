@@ -42,7 +42,7 @@ pub use tools::{
     MedicalApprovalDecision, MedicalApprovalPolicy, MedicalToolContext, MedicalToolError,
     MedicalToolInvocation, MedicalToolOutput, MedicalToolPayload, MedicalToolRisk,
     MedicalToolRuntime, MedicalToolRuntimeRegistry, ReadPatientSummaryRequest,
-    SaveNoteDraftRequest,
+    SaveNoteDraftRequest, SignNoteRequest,
 };
 pub use turn::{
     ActiveMedicalTurn, ActiveMedicalTurnError, MedicalActiveTurnStatus, MedicalPendingApproval,
@@ -208,6 +208,7 @@ pub enum MedicalToolName {
     ListEncounters,
     CreateNoteDraft,
     UpdateNoteDraft,
+    SignNote,
     RunDocumentationAudit,
     PrepareSuperbillDraft,
     CheckVendorBaa,
@@ -233,6 +234,7 @@ impl MedicalToolName {
             Self::ListEncounters => "chart.list_encounters",
             Self::CreateNoteDraft => "note.create_draft",
             Self::UpdateNoteDraft => "note.update_draft",
+            Self::SignNote => "note.sign",
             Self::RunDocumentationAudit => "note.run_documentation_audit",
             Self::PrepareSuperbillDraft => "billing.prepare_superbill_draft",
             Self::CheckVendorBaa => "compliance.check_vendor_baa",
@@ -274,6 +276,10 @@ impl MedicalToolRegistry {
         registry.register(MedicalToolSpec::reviewed_local(
             MedicalToolName::UpdateNoteDraft,
             "Update a local structured note draft",
+        ));
+        registry.register(MedicalToolSpec::reviewed_local(
+            MedicalToolName::SignNote,
+            "Sign a local structured note after human confirmation",
         ));
         registry.register(MedicalToolSpec::local(
             MedicalToolName::RunDocumentationAudit,

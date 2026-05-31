@@ -32,6 +32,15 @@ pub enum StoreError {
 
     #[error("invalid note version value: {0}")]
     InvalidNoteVersion(i64),
+
+    #[error("note not found: {0}")]
+    NoteNotFound(NoteId),
+
+    #[error("signed note is immutable: {0}")]
+    SignedNoteImmutable(NoteId),
+
+    #[error("note {note_id} cannot be signed because status is {status}")]
+    NoteNotSignable { note_id: NoteId, status: String },
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -196,6 +205,12 @@ impl LocalStore {
     }
 
     pub fn upsert_note(&self, note: &ClinicalNote) -> StoreResult<()> {
+        if let Some(existing_status) = self.note_status(note.id)? {
+            if matches!(existing_status, NoteStatus::Signed) {
+                return Err(StoreError::SignedNoteImmutable(note.id));
+            }
+        }
+
         self.connection.execute(
             "insert into notes (
                 id, patient_id, encounter_id, author_id, template, status, version, created_at, updated_at, signed_at
@@ -244,6 +259,38 @@ impl LocalStore {
         }
 
         Ok(())
+    }
+
+    pub fn sign_note_draft(
+        &self,
+        note_id: NoteId,
+        signed_at: OffsetDateTime,
+    ) -> StoreResult<ClinicalNote> {
+        let note = self
+            .get_note(note_id)?
+            .ok_or(StoreError::NoteNotFound(note_id))?;
+
+        if !matches!(note.status, NoteStatus::Draft) {
+            return Err(StoreError::NoteNotSignable {
+                note_id,
+                status: note_status_label(&note.status).to_owned(),
+            });
+        }
+
+        self.connection.execute(
+            "update notes
+             set status = ?1, updated_at = ?2, signed_at = ?3
+             where id = ?4",
+            params![
+                serde_json::to_string(&NoteStatus::Signed)?,
+                format_offset_date_time(signed_at)?,
+                format_offset_date_time(signed_at)?,
+                note_id.to_string(),
+            ],
+        )?;
+
+        self.get_note(note_id)?
+            .ok_or(StoreError::NoteNotFound(note_id))
     }
 
     pub fn get_note(&self, id: NoteId) -> StoreResult<Option<ClinicalNote>> {
@@ -366,6 +413,20 @@ impl LocalStore {
         })
     }
 
+    fn note_status(&self, note_id: NoteId) -> StoreResult<Option<NoteStatus>> {
+        let mut statement = self
+            .connection
+            .prepare("select status from notes where id = ?1")?;
+        let mut rows = statement.query(params![note_id.to_string()])?;
+
+        if let Some(row) = rows.next()? {
+            let status: String = row.get(0)?;
+            return Ok(Some(serde_json::from_str::<NoteStatus>(&status)?));
+        }
+
+        Ok(None)
+    }
+
     fn list_note_sections(&self, note_id: NoteId) -> StoreResult<Vec<NoteSection>> {
         let mut statement = self.connection.prepare(
             "select heading, body, required
@@ -463,6 +524,16 @@ fn parse_uuid(value: &str) -> StoreResult<Uuid> {
 
 fn parse_practitioner_id(value: &str) -> StoreResult<PractitionerId> {
     parse_uuid(value)
+}
+
+fn note_status_label(status: &NoteStatus) -> &'static str {
+    match status {
+        NoteStatus::Draft => "Draft",
+        NoteStatus::Reviewed => "Reviewed",
+        NoteStatus::Signed => "Signed",
+        NoteStatus::Amended => "Amended",
+        NoteStatus::Voided => "Voided",
+    }
 }
 
 fn format_offset_date_time(value: OffsetDateTime) -> StoreResult<String> {
@@ -736,5 +807,62 @@ mod tests {
         assert_eq!(notes[0].id, latest_draft.id);
         assert_eq!(loaded_latest_draft.id, latest_draft.id);
         assert_eq!(loaded_latest_draft.sections[0].body, "Latest draft");
+    }
+
+    #[test]
+    fn signs_draft_note_and_blocks_later_updates() {
+        let store = open_test_store();
+        let now = OffsetDateTime::now_utc();
+        let patient = Patient {
+            id: new_id(),
+            medical_record_number: None,
+            display_name: "Sign Test Patient".to_owned(),
+            date_of_birth: None,
+            sex_at_birth: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let encounter = Encounter {
+            id: new_id(),
+            patient_id: patient.id,
+            practitioner_id: None,
+            encounter_type: EncounterType::OfficeVisit,
+            status: EncounterStatus::InProgress,
+            started_at: now,
+            ended_at: None,
+            reason: Some("Synthetic signing".to_owned()),
+        };
+        let mut note = ClinicalNote {
+            id: new_id(),
+            patient_id: patient.id,
+            encounter_id: encounter.id,
+            author_id: None,
+            template: NoteTemplate::Soap,
+            status: NoteStatus::Draft,
+            sections: vec![NoteSection {
+                heading: "Subjective".to_owned(),
+                body: "Draft body".to_owned(),
+                required: true,
+            }],
+            created_at: now,
+            updated_at: now,
+            signed_at: None,
+            version: 1,
+        };
+
+        store.insert_patient(&patient).unwrap();
+        store.insert_encounter(&encounter).unwrap();
+        store.upsert_note(&note).unwrap();
+
+        let signed_at = now + time::Duration::minutes(2);
+        let signed = store.sign_note_draft(note.id, signed_at).unwrap();
+
+        assert!(matches!(signed.status, NoteStatus::Signed));
+        assert_eq!(signed.signed_at, Some(signed_at));
+
+        note.sections[0].body = "Changed after signing".to_owned();
+        let error = store.upsert_note(&note).unwrap_err();
+
+        assert!(matches!(error, StoreError::SignedNoteImmutable(id) if id == note.id));
     }
 }

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use med_agent::{
     MedicalApprovalPolicy, MedicalToolContext, MedicalToolInvocation, MedicalToolPayload,
-    MedicalToolRuntimeRegistry, SaveNoteDraftRequest,
+    MedicalToolRuntimeRegistry, SaveNoteDraftRequest, SignNoteRequest,
 };
 use med_core::{
     new_id, ClinicalNote, Encounter, EncounterId, EncounterStatus, EncounterType, NoteId,
@@ -12,8 +12,9 @@ use med_store::LocalStore;
 use time::{Date, OffsetDateTime};
 use tui_textarea::{CursorMove, Input, Key, TextArea};
 
-const SIGNING_BLOCKED_MESSAGE: &str =
-    "Signing guardrail: final signing is not implemented; draft remains editable";
+const SIGNING_ARMED_MESSAGE: &str = "Press S again to sign this note; any other key cancels";
+const SIGNED_NOTE_LOCKED_MESSAGE: &str =
+    "Signed note is immutable; future edits require an amendment flow";
 
 #[derive(Debug, Clone)]
 pub struct App {
@@ -26,6 +27,8 @@ pub struct App {
     pub note_status: Option<String>,
     pub note_version: Option<u32>,
     pub note_updated_at: Option<String>,
+    pub note_signed_at: Option<String>,
+    pub note_signing_armed: bool,
     pub note_dirty: bool,
     pub last_message: String,
     pub should_quit: bool,
@@ -43,6 +46,8 @@ impl Default for App {
             note_status: None,
             note_version: None,
             note_updated_at: None,
+            note_signed_at: None,
+            note_signing_armed: false,
             note_dirty: false,
             last_message: "Local database not loaded".to_owned(),
             should_quit: false,
@@ -73,13 +78,24 @@ impl App {
     }
 
     pub fn handle_key_with_store(&mut self, key: KeyEvent, store: &LocalStore) -> Result<()> {
+        if self.selected_tab == WorkspaceTab::Note && is_note_sign_key(key) {
+            if self.note_signing_armed {
+                self.sign_note(store)?;
+            } else {
+                self.arm_note_signing();
+            }
+            return Ok(());
+        }
+
+        self.cancel_note_signing_confirmation();
+
         if self.note_editor_active() && is_note_save_key(key) {
             self.save_note_draft(store)?;
             return Ok(());
         }
 
-        if self.selected_tab == WorkspaceTab::Note && is_note_sign_key(key) {
-            self.block_note_signing();
+        if self.note_editor_active() && self.note_is_signed() && is_note_editor_input_key(key) {
+            self.block_signed_note_edit();
             return Ok(());
         }
 
@@ -114,9 +130,11 @@ impl App {
         }
 
         if self.selected_tab == WorkspaceTab::Note && is_note_sign_key(key) {
-            self.block_note_signing();
+            self.arm_note_signing();
             return;
         }
+
+        self.cancel_note_signing_confirmation();
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
@@ -142,6 +160,10 @@ impl App {
 
     pub fn note_editor_active(&self) -> bool {
         self.selected_tab == WorkspaceTab::Note && self.focus == FocusArea::Workspace
+    }
+
+    pub fn note_is_signed(&self) -> bool {
+        self.note_status.as_deref() == Some("Signed")
     }
 
     fn refresh_from_store_with_selection(
@@ -211,6 +233,11 @@ impl App {
     }
 
     fn save_note_draft(&mut self, store: &LocalStore) -> Result<()> {
+        if self.note_is_signed() {
+            self.block_signed_note_edit();
+            return Ok(());
+        }
+
         let Some(patient_id) = self.active_patient().map(|patient| patient.id) else {
             self.last_message = "Create or select a patient before saving a note".to_owned();
             return Ok(());
@@ -265,6 +292,13 @@ impl App {
         if let Some(note) = store.latest_draft_note_for_encounter(encounter_id)? {
             self.note_editor = note_editor_from_sections(&note.sections);
             self.apply_note_metadata(&note);
+        } else if let Some(note) = store
+            .list_notes_for_encounter(encounter_id)?
+            .into_iter()
+            .next()
+        {
+            self.note_editor = note_editor_from_sections(&note.sections);
+            self.apply_note_metadata(&note);
         } else {
             self.reset_note_editor();
         }
@@ -277,6 +311,8 @@ impl App {
         self.note_status = Some(note_status_label(&note.status).to_owned());
         self.note_version = Some(note.version);
         self.note_updated_at = Some(note.updated_at.to_string());
+        self.note_signed_at = note.signed_at.map(|signed_at| signed_at.to_string());
+        self.note_signing_armed = false;
         self.note_dirty = false;
     }
 
@@ -286,21 +322,91 @@ impl App {
         self.note_status = None;
         self.note_version = None;
         self.note_updated_at = None;
+        self.note_signed_at = None;
+        self.note_signing_armed = false;
         self.note_dirty = false;
     }
 
-    fn block_note_signing(&mut self) {
-        self.last_message = SIGNING_BLOCKED_MESSAGE.to_owned();
+    fn arm_note_signing(&mut self) {
+        if self.note_draft_id.is_none() {
+            self.note_signing_armed = false;
+            self.last_message = "Save a draft before signing".to_owned();
+            return;
+        }
+
+        if self.note_is_signed() {
+            self.note_signing_armed = false;
+            self.last_message = "Note is already signed".to_owned();
+            return;
+        }
+
+        if self.note_dirty {
+            self.note_signing_armed = false;
+            self.last_message = "Save the draft before signing".to_owned();
+            return;
+        }
+
+        self.note_signing_armed = true;
+        self.last_message = SIGNING_ARMED_MESSAGE.to_owned();
+    }
+
+    fn sign_note(&mut self, store: &LocalStore) -> Result<()> {
+        let Some(note_id) = self.note_draft_id else {
+            self.note_signing_armed = false;
+            self.last_message = "Save a draft before signing".to_owned();
+            return Ok(());
+        };
+        let Some(patient_id) = self.active_patient().map(|patient| patient.id) else {
+            self.note_signing_armed = false;
+            self.last_message = "Select a patient before signing".to_owned();
+            return Ok(());
+        };
+        let Some(encounter_id) = self.active_encounter().map(|encounter| encounter.id) else {
+            self.note_signing_armed = false;
+            self.last_message = "Select an encounter before signing".to_owned();
+            return Ok(());
+        };
+
+        let registry = MedicalToolRuntimeRegistry::default();
+        let output = registry.dispatch(MedicalToolInvocation {
+            store,
+            call_id: format!("tui-note-sign-{}", short_id(new_id())),
+            tool_name: med_agent::MedicalToolName::SignNote,
+            payload: MedicalToolPayload::SignNote(SignNoteRequest {
+                note_id,
+                patient_id,
+                encounter_id,
+            }),
+            context: MedicalToolContext::default(),
+            approval_policy: MedicalApprovalPolicy::after_human_confirmation(),
+        })?;
+        let note = store
+            .get_note(note_id)?
+            .ok_or_else(|| anyhow!("signed note {note_id} was not found"))?;
+
+        self.apply_note_metadata(&note);
+        self.last_message = output.tui_summary;
+
+        Ok(())
+    }
+
+    fn cancel_note_signing_confirmation(&mut self) {
+        self.note_signing_armed = false;
+    }
+
+    fn block_signed_note_edit(&mut self) {
+        self.note_signing_armed = false;
+        self.last_message = SIGNED_NOTE_LOCKED_MESSAGE.to_owned();
 
         if !self
             .data
             .audit_flags
             .iter()
-            .any(|flag| flag.message == SIGNING_BLOCKED_MESSAGE)
+            .any(|flag| flag.message == SIGNED_NOTE_LOCKED_MESSAGE)
         {
             self.data
                 .audit_flags
-                .push(AuditFlagItem::blocked(SIGNING_BLOCKED_MESSAGE));
+                .push(AuditFlagItem::blocked(SIGNED_NOTE_LOCKED_MESSAGE));
         }
     }
 
@@ -1267,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn sign_key_is_blocked_without_changing_draft_status() {
+    fn sign_key_requires_second_confirmation_before_signing() {
         let (store, path) = temp_store();
         let (patient_id, encounter_id) =
             insert_patient_with_encounter(&store, "Synthetic Sign Guard Patient");
@@ -1290,12 +1396,109 @@ mod tests {
 
         assert!(matches!(note.status, NoteStatus::Draft));
         assert_eq!(app.note_draft_id, Some(note_id));
-        assert!(app.last_message.contains("Signing guardrail"));
-        assert!(app
-            .data
-            .audit_flags
-            .iter()
-            .any(|flag| flag.message == SIGNING_BLOCKED_MESSAGE));
+        assert!(app.note_signing_armed);
+        assert_eq!(app.last_message, SIGNING_ARMED_MESSAGE);
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn second_sign_key_signs_note_and_writes_audit_event() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) =
+            insert_patient_with_encounter(&store, "Synthetic Sign Patient");
+        let note_id = upsert_test_note(
+            &store,
+            patient_id,
+            encounter_id,
+            "Ready to sign",
+            OffsetDateTime::now_utc(),
+            1,
+        );
+        let mut app = App::from_store(&store).unwrap();
+        app.selected_tab = WorkspaceTab::Note;
+        app.focus = FocusArea::Workspace;
+        let before = store.audit_event_count().unwrap();
+
+        app.handle_key_with_store(key(KeyCode::Char('S')), &store)
+            .unwrap();
+        app.handle_key_with_store(key(KeyCode::Char('S')), &store)
+            .unwrap();
+
+        let note = store.get_note(note_id).unwrap().unwrap();
+
+        assert!(matches!(note.status, NoteStatus::Signed));
+        assert!(note.signed_at.is_some());
+        assert_eq!(app.note_status.as_deref(), Some("Signed"));
+        assert!(app.note_signed_at.is_some());
+        assert!(!app.note_signing_armed);
+        assert_eq!(store.audit_event_count().unwrap(), before + 1);
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn navigation_cancels_armed_note_signing() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) =
+            insert_patient_with_encounter(&store, "Synthetic Cancel Patient");
+        upsert_test_note(
+            &store,
+            patient_id,
+            encounter_id,
+            "Cancel signing",
+            OffsetDateTime::now_utc(),
+            1,
+        );
+        let mut app = App::from_store(&store).unwrap();
+        app.selected_tab = WorkspaceTab::Note;
+        app.focus = FocusArea::Workspace;
+
+        app.handle_key_with_store(key(KeyCode::Char('S')), &store)
+            .unwrap();
+        app.handle_key_with_store(key(KeyCode::Tab), &store)
+            .unwrap();
+
+        assert!(!app.note_signing_armed);
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn signed_note_blocks_edits_and_saves() {
+        let (store, path) = temp_store();
+        let (patient_id, encounter_id) =
+            insert_patient_with_encounter(&store, "Synthetic Locked Patient");
+        let note_id = upsert_test_note(
+            &store,
+            patient_id,
+            encounter_id,
+            "Locked content",
+            OffsetDateTime::now_utc(),
+            1,
+        );
+        store
+            .sign_note_draft(note_id, OffsetDateTime::now_utc())
+            .unwrap();
+        let mut app = App::from_store(&store).unwrap();
+        app.selected_tab = WorkspaceTab::Note;
+        app.focus = FocusArea::Workspace;
+
+        app.handle_key_with_store(key(KeyCode::Char('x')), &store)
+            .unwrap();
+        app.handle_key_with_store(ctrl_key(KeyCode::Char('s')), &store)
+            .unwrap();
+
+        let note = store.get_note(note_id).unwrap().unwrap();
+
+        assert_eq!(app.note_editor.lines()[1], "Locked content");
+        assert!(!app.note_dirty);
+        assert!(matches!(note.status, NoteStatus::Signed));
+        assert_eq!(note.sections[0].body, "Locked content");
+        assert_eq!(app.last_message, SIGNED_NOTE_LOCKED_MESSAGE);
 
         drop(store);
         cleanup(path);
