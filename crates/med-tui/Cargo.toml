@@ -9,8 +9,10 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 crossterm.workspace = true
+med-agent = { path = "../med-agent" }
 med-core = { path = "../med-core" }
 med-store = { path = "../med-store" }
 ratatui.workspace = true
+serde_json.workspace = true
 time.workspace = true
 tui-textarea.workspace = true

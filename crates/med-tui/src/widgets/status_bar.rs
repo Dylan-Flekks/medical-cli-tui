@@ -4,7 +4,7 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::{AiStatus, App};
+use crate::app::{AiStatus, App, WorkspaceTab};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let ai = match app.data.ai_status {
@@ -12,7 +12,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         AiStatus::Allowed => " AI BAA gate: allowed ",
     };
 
-    let status = Line::from(vec![
+    let mut spans = vec![
         " q ".black().on_cyan(),
         " quit  ".into(),
         " tab ".black().on_cyan(),
@@ -27,6 +27,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         " encounter  ".into(),
         " r ".black().on_cyan(),
         " refresh  ".into(),
+    ];
+
+    if app.selected_tab == WorkspaceTab::Note {
+        spans.extend([" ctrl+s ".black().on_cyan(), " save  ".into()]);
+    }
+
+    spans.extend([
         format!(" focus: {} ", app.focus.title())
             .black()
             .on_dark_gray(),
@@ -34,6 +41,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ai.black().on_yellow(),
         format!(" {} ", app.last_message).black().on_dark_gray(),
     ]);
+
+    let status = Line::from(spans);
 
     frame.render_widget(Paragraph::new(status), area);
 }

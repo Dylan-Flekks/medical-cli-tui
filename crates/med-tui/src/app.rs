@@ -1,8 +1,16 @@
-use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent};
-use med_core::{new_id, Encounter, EncounterStatus, EncounterType, Patient, PatientId};
+use anyhow::{anyhow, Result};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use med_agent::{
+    MedicalApprovalPolicy, MedicalToolContext, MedicalToolInvocation, MedicalToolPayload,
+    MedicalToolRuntimeRegistry, SaveNoteDraftRequest,
+};
+use med_core::{
+    new_id, Encounter, EncounterId, EncounterStatus, EncounterType, NoteId, NoteSection,
+    NoteTemplate, Patient, PatientId,
+};
 use med_store::LocalStore;
 use time::{Date, OffsetDateTime};
+use tui_textarea::{CursorMove, Input, Key, TextArea};
 
 #[derive(Debug, Clone)]
 pub struct App {
@@ -10,6 +18,9 @@ pub struct App {
     pub selected_patient: usize,
     pub selected_tab: WorkspaceTab,
     pub data: DashboardData,
+    pub note_editor: TextArea<'static>,
+    pub note_draft_id: Option<NoteId>,
+    pub note_dirty: bool,
     pub last_message: String,
     pub should_quit: bool,
 }
@@ -21,6 +32,9 @@ impl Default for App {
             selected_patient: 0,
             selected_tab: WorkspaceTab::Chart,
             data: DashboardData::empty(),
+            note_editor: default_note_editor(),
+            note_draft_id: None,
+            note_dirty: false,
             last_message: "Local database not loaded".to_owned(),
             should_quit: false,
         }
@@ -50,6 +64,16 @@ impl App {
     }
 
     pub fn handle_key_with_store(&mut self, key: KeyEvent, store: &LocalStore) -> Result<()> {
+        if self.note_editor_active() && is_note_save_key(key) {
+            self.save_note_draft(store)?;
+            return Ok(());
+        }
+
+        if self.note_editor_active() && is_note_editor_input_key(key) {
+            self.note_dirty |= self.note_editor.input(note_editor_input(key));
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Char('r') => {
                 self.refresh_from_store(store)?;
@@ -64,6 +88,11 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.note_editor_active() && is_note_editor_input_key(key) {
+            self.note_dirty |= self.note_editor.input(note_editor_input(key));
+            return;
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Tab => self.focus_next(),
@@ -86,6 +115,10 @@ impl App {
         self.data.encounters.first()
     }
 
+    pub fn note_editor_active(&self) -> bool {
+        self.selected_tab == WorkspaceTab::Note && self.focus == FocusArea::Workspace
+    }
+
     fn refresh_from_store_with_selection(
         &mut self,
         store: &LocalStore,
@@ -99,9 +132,14 @@ impl App {
             records.push((patient, encounters));
         }
 
+        let previous_patient_id = self.active_patient().map(|patient| patient.id);
         self.selected_patient =
             selected_patient_index(&records, preferred_patient_id, self.selected_patient);
         self.data = DashboardData::from_local_records(&records, self.selected_patient);
+        let current_patient_id = self.active_patient().map(|patient| patient.id);
+        if previous_patient_id != current_patient_id {
+            self.reset_note_editor();
+        }
 
         Ok(())
     }
@@ -146,9 +184,60 @@ impl App {
 
         store.insert_encounter(&encounter)?;
         self.refresh_from_store_with_selection(store, Some(patient_id))?;
+        self.reset_note_editor();
         self.last_message = "Created local encounter".to_owned();
 
         Ok(())
+    }
+
+    fn save_note_draft(&mut self, store: &LocalStore) -> Result<()> {
+        let Some(patient_id) = self.active_patient().map(|patient| patient.id) else {
+            self.last_message = "Create or select a patient before saving a note".to_owned();
+            return Ok(());
+        };
+        let Some(encounter_id) = self.active_encounter().map(|encounter| encounter.id) else {
+            self.last_message = "Create an encounter before saving a note".to_owned();
+            return Ok(());
+        };
+
+        let tool_name = if self.note_draft_id.is_some() {
+            med_agent::MedicalToolName::UpdateNoteDraft
+        } else {
+            med_agent::MedicalToolName::CreateNoteDraft
+        };
+        let registry = MedicalToolRuntimeRegistry::default();
+        let output = registry.dispatch(MedicalToolInvocation {
+            store,
+            call_id: format!("tui-note-save-{}", short_id(new_id())),
+            tool_name,
+            payload: MedicalToolPayload::SaveNoteDraft(SaveNoteDraftRequest {
+                note_id: self.note_draft_id,
+                patient_id,
+                encounter_id,
+                template: NoteTemplate::Soap,
+                sections: note_sections_from_lines(self.note_editor.lines()),
+            }),
+            context: MedicalToolContext::default(),
+            approval_policy: MedicalApprovalPolicy::local_default(),
+        })?;
+
+        let note_id = output
+            .structured
+            .get("note_id")
+            .cloned()
+            .ok_or_else(|| anyhow!("save note tool did not return note_id"))
+            .and_then(|value| serde_json::from_value(value).map_err(Into::into))?;
+        self.note_draft_id = Some(note_id);
+        self.note_dirty = false;
+        self.last_message = output.tui_summary;
+
+        Ok(())
+    }
+
+    fn reset_note_editor(&mut self) {
+        self.note_editor = default_note_editor();
+        self.note_draft_id = None;
+        self.note_dirty = false;
     }
 
     fn focus_next(&mut self) {
@@ -175,6 +264,7 @@ impl App {
         }
 
         self.selected_patient = (self.selected_patient + 1) % self.data.patients.len();
+        self.reset_note_editor();
         self.last_message = self.selection_message();
     }
 
@@ -188,6 +278,7 @@ impl App {
         } else {
             self.selected_patient - 1
         };
+        self.reset_note_editor();
         self.last_message = self.selection_message();
     }
 
@@ -361,6 +452,7 @@ impl DashboardData {
                 },
             ],
             encounters: vec![EncounterItem {
+                id: encounter,
                 short_id: short_id(encounter),
                 started_at: "2026-05-28".to_owned(),
                 encounter_type: "Office visit".to_owned(),
@@ -415,6 +507,7 @@ pub struct PatientQueueItem {
 
 #[derive(Debug, Clone)]
 pub struct EncounterItem {
+    pub id: EncounterId,
     pub short_id: String,
     pub started_at: String,
     pub encounter_type: String,
@@ -544,6 +637,7 @@ fn patient_queue_item(
 
 fn encounter_item(encounter: &Encounter) -> EncounterItem {
     EncounterItem {
+        id: encounter.id,
         short_id: short_id(encounter.id),
         started_at: encounter.started_at.date().to_string(),
         encounter_type: encounter_type_label(&encounter.encounter_type),
@@ -552,7 +646,7 @@ fn encounter_item(encounter: &Encounter) -> EncounterItem {
     }
 }
 
-fn short_id(id: med_core::EncounterId) -> String {
+fn short_id(id: impl std::fmt::Display) -> String {
     id.to_string()[..8].to_owned()
 }
 
@@ -623,6 +717,133 @@ fn ai_blocked_count(ai_status: AiStatus) -> usize {
     }
 }
 
+fn default_note_editor() -> TextArea<'static> {
+    let mut textarea = TextArea::from([
+        "Subjective:",
+        "",
+        "Objective:",
+        "",
+        "Assessment:",
+        "",
+        "Plan:",
+        "",
+    ]);
+    textarea.move_cursor(CursorMove::Jump(1, 0));
+    textarea
+}
+
+fn is_note_save_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn is_note_editor_input_key(key: KeyEvent) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
+
+    !matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab)
+}
+
+fn note_editor_input(key: KeyEvent) -> Input {
+    if key.kind == KeyEventKind::Release {
+        return Input::default();
+    }
+
+    let textarea_key = match key.code {
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Insert => Key::Null,
+        KeyCode::F(value) => Key::F(value),
+        KeyCode::Char(value) => Key::Char(value),
+        KeyCode::Esc
+        | KeyCode::BackTab
+        | KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => Key::Null,
+    };
+
+    Input {
+        key: textarea_key,
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        alt: key.modifiers.contains(KeyModifiers::ALT),
+        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+    }
+}
+
+fn note_sections_from_lines(lines: &[String]) -> Vec<NoteSection> {
+    const HEADINGS: [&str; 4] = ["Subjective", "Objective", "Assessment", "Plan"];
+
+    let mut buckets: [Vec<String>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut current_section = 0;
+
+    for line in lines {
+        if let Some(index) = soap_heading_index(line) {
+            current_section = index;
+            continue;
+        }
+
+        buckets[current_section].push(line.clone());
+    }
+
+    HEADINGS
+        .iter()
+        .enumerate()
+        .map(|(index, heading)| NoteSection {
+            heading: (*heading).to_owned(),
+            body: note_section_body(&buckets[index]),
+            required: true,
+        })
+        .collect()
+}
+
+fn soap_heading_index(line: &str) -> Option<usize> {
+    match line
+        .trim()
+        .trim_end_matches(':')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "subjective" => Some(0),
+        "objective" => Some(1),
+        "assessment" => Some(2),
+        "plan" => Some(3),
+        _ => None,
+    }
+}
+
+fn note_section_body(lines: &[String]) -> String {
+    let mut start = 0;
+    let mut end = lines.len();
+
+    while start < end && lines[start].trim().is_empty() {
+        start += 1;
+    }
+
+    while end > start && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+
+    lines[start..end].join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +853,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
     fn temp_store() -> (LocalStore, PathBuf) {
@@ -675,6 +900,18 @@ mod tests {
 
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, FocusArea::Workspace);
+    }
+
+    #[test]
+    fn note_editor_accepts_text_when_note_workspace_is_active() {
+        let mut app = App::with_data(DashboardData::synthetic());
+        app.selected_tab = WorkspaceTab::Note;
+        app.focus = FocusArea::Workspace;
+
+        app.handle_key(key(KeyCode::Char('x')));
+
+        assert_eq!(app.note_editor.lines()[1], "x");
+        assert!(app.note_dirty);
     }
 
     #[test]
@@ -736,6 +973,48 @@ mod tests {
         assert_eq!(encounters.len(), 1);
         assert_eq!(app.data.encounters.len(), 1);
         assert_eq!(app.data.encounters[0].short_id, short_id(encounters[0].id));
+
+        drop(store);
+        cleanup(path);
+    }
+
+    #[test]
+    fn save_note_draft_persists_note_for_active_encounter() {
+        let (store, path) = temp_store();
+        let mut app = App::from_store(&store).unwrap();
+
+        app.handle_key_with_store(key(KeyCode::Char('n')), &store)
+            .unwrap();
+        app.handle_key_with_store(key(KeyCode::Char('e')), &store)
+            .unwrap();
+        app.selected_tab = WorkspaceTab::Note;
+        app.focus = FocusArea::Workspace;
+        app.note_editor = TextArea::from([
+            "Subjective:",
+            "Synthetic subjective text",
+            "Objective:",
+            "Synthetic objective text",
+            "Assessment:",
+            "Synthetic assessment text",
+            "Plan:",
+            "Synthetic plan text",
+        ]);
+        app.note_dirty = true;
+
+        let before = store.audit_event_count().unwrap();
+        app.handle_key_with_store(ctrl_key(KeyCode::Char('s')), &store)
+            .unwrap();
+
+        let note_id = app.note_draft_id.unwrap();
+        let note = store.get_note(note_id).unwrap().unwrap();
+
+        assert_eq!(note.patient_id, app.active_patient().unwrap().id);
+        assert_eq!(note.encounter_id, app.active_encounter().unwrap().id);
+        assert_eq!(note.sections.len(), 4);
+        assert_eq!(note.sections[0].heading, "Subjective");
+        assert_eq!(note.sections[0].body, "Synthetic subjective text");
+        assert!(!app.note_dirty);
+        assert_eq!(store.audit_event_count().unwrap(), before + 1);
 
         drop(store);
         cleanup(path);

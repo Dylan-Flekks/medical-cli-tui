@@ -137,42 +137,21 @@ fn render_chart(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_note(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let encounter_context = app
-        .active_encounter()
-        .map(|encounter| {
-            format!(
-                "{} | {} | {}",
-                encounter.started_at, encounter.encounter_type, encounter.status
-            )
-        })
-        .unwrap_or_else(|| "No active encounter".to_owned());
-    let text = [
-        "SOAP Note - Draft",
-        encounter_context.as_str(),
-        "",
-        "Subjective:",
-        "",
-        "",
-        "Objective:",
-        "",
-        "",
-        "Assessment:",
-        "",
-        "",
-        "Plan:",
-        "",
-    ]
-    .join("\n");
+    let mut editor = app.note_editor.clone();
+    let title = if app.note_dirty {
+        "Structured SOAP Draft *"
+    } else {
+        "Structured SOAP Draft"
+    };
 
-    let paragraph = Paragraph::new(text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Structured Note"),
-        )
-        .wrap(Wrap { trim: false });
+    editor.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(theme::panel_border(app.focus, FocusArea::Workspace)),
+    );
 
-    frame.render_widget(paragraph, area);
+    frame.render_widget(&editor, area);
 }
 
 fn render_audit(frame: &mut Frame<'_>, area: Rect, app: &App) {
