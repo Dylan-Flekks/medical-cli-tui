@@ -6,6 +6,14 @@ The project goal is a CLI-first medical records tool with a Ratatui dashboard. M
 
 > This project is not a certified EHR, medical device, billing authority, or compliance guarantee. Do not use it for real patient care or real PHI until it has gone through professional security, legal, privacy, and clinical review.
 
+## Codex CLI Team Request
+
+This fork includes a focused request for the Codex CLI team:
+
+[README-CODEX-TEAM.md](README-CODEX-TEAM.md)
+
+The request asks for an agentic medical workflow harness with local agent loops, TUI audit dashboards, macOS authorization-aware automation, multimodal inputs, and plugin surfaces for chart editing, billing support, Medicare policy, ICD coding, and compliance review.
+
 ## Product Direction
 
 - Local encrypted SQLite records.
